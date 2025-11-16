@@ -1,0 +1,10 @@
+menu "Motor Controller Configuration"
+    config SINE_WAVE_SAMPLE_TIMEus
+        int "Sine wave sample time (us)"
+        range 100 500
+        default 200
+        help
+            The sample time of the generated sine wave.
+            This value influences the "graininess" of the output signal and the maximum frecuency that the controller can generate.
+            A value of 100us corresponds to about a maximum frecuency of 1.25kHz, while a value of 500us yields a maximum frecuency of 250Hz
+endmenu
