@@ -1,0 +1,5 @@
+# Ignora la carpeta de configuracion de Visual Studio Code
+.vscode/
+
+# Ignora la carpeta de compilacion de ESP-IDF
+build/
