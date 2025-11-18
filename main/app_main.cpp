@@ -1,68 +1,105 @@
 /**
- * ARCHIVO: main/app_main.cpp
- * * Lógica principal que combina:
- * 1. Controlador de motor AC (drivers/HAL/phases.hpp)
- * 2. Lector de Encoder (para feedback de RPM)
- * 3. Comunicación UART (para recibir comandos y enviar telemetría)
- * * Incluye un interruptor de #define para modo de prueba.
+ * main/app_main.cpp
+ * PID CONTROL VERSION (Frequency/Amplitude via UART)
+ * - Notification-based architecture
+ * - Timer ISR notifies tasks to update SPWM
+ * - UART receives Frequency (CH1), Amplitude (CH2), RPM_Ref (CH3)
  */
 
 #include <stdio.h>
+#include <string>
 #include <math.h>
+#include <stdlib.h> 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
-#include "driver/ledc.h"
 #include "esp_log.h"
-#include "soc/gpio_struct.h"
 #include "phases.hpp"
-
+#include "pwm.h"
 
 #define TAG "MOTOR_AC_UART"
-
-// --- Interruptor de Pruebas ---
-// Poner en 1 para activar el MODO PRUEBA (frecuencia fija, para LED)
-// Poner en 0 para activar el MODO REAL (control por UART)
 #define RUN_TEST_MODE 0
 
-
-// ================== Pins ==================
-#define PIN_ENC_A      GPIO_NUM_14 // Encoder en pines libres
+// Encoder Pins
+#define PIN_ENC_A      GPIO_NUM_14
 #define PIN_ENC_B      GPIO_NUM_15
 
-// ================== UART ===================
+// UART
 #define UART_PORT      UART_NUM_0
 #define UART_BAUD      115200
 
-// ================== Encoder ===================
+// Encoder constants
 #define PULSES_PER_REV 199
 #define SAMPLE_MS       10
 #define ALPHA           0.1f
 
-// ================== Scaling ===================
-#define RPM_MAX         10000.0
+// Sequence pulse interval (T_pulse) in ms
+#define T_PULSE_MS      250
 
-// ================== Globals ===================
-static volatile long g_pulse_count = 0;
+// Seq buffer
+#define MAX_SEQ_LEN 16
+
+// SEQUENCE STRUCT UPDATED TO uint32_t
+typedef struct {
+    uint8_t len;
+    uint32_t vals[MAX_SEQ_LEN];
+} seq_t;
+
+// Globals
+static volatile int32_t g_pulse_count = 0;
 static volatile uint8_t old_AB = 0;
 static const int8_t QEM[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
-static uint16_t g_rpm_ref  = 0;
+static volatile uint16_t g_rpm_ref  = 0;
 static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 
-// ================== Encoder ISR ===================
+static pwm_task_config_t pwmA;
+static pwm_task_config_t pwmB;
+static pwm_task_config_t pwmC;
+
+// Task handles for notifications
+static TaskHandle_t pwmA_task_handle = NULL;
+static TaskHandle_t pwmB_task_handle = NULL;
+static TaskHandle_t pwmC_task_handle = NULL;
+
+// Command queues (length 1)
+static QueueHandle_t cmdQueueA = NULL;
+static QueueHandle_t cmdQueueB = NULL;
+static QueueHandle_t cmdQueueC = NULL;
+
+// ========== Encoder ISR ==========
 static void IRAM_ATTR encoder_isr(void *arg)
 {
-    uint32_t gpio_in = GPIO.in;
+    portENTER_CRITICAL_ISR(&spinlock);
+    int state_A = gpio_get_level(PIN_ENC_A);
+    int state_B = gpio_get_level(PIN_ENC_B);
     old_AB <<= 2;
-    uint8_t state_A = (gpio_in >> PIN_ENC_A) & 1;
-    uint8_t state_B = (gpio_in >> PIN_ENC_B) & 1;
     uint8_t new_AB = (state_A << 1) | state_B;
     old_AB |= new_AB;
     g_pulse_count += QEM[old_AB & 0x0F];
+    portEXIT_CRITICAL_ISR(&spinlock);
 }
 
-// ================== UART INIT ===================
+// ========== NOTIFICATION FROM PHASES ISR ==========
+void phases_notify_pwm_tasks_from_isr(void)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    if (pwmA_task_handle) {
+        vTaskNotifyGiveFromISR(pwmA_task_handle, &xHigherPriorityTaskWoken);
+    }
+    if (pwmB_task_handle) {
+        vTaskNotifyGiveFromISR(pwmB_task_handle, &xHigherPriorityTaskWoken);
+    }
+    if (pwmC_task_handle) {
+        vTaskNotifyGiveFromISR(pwmC_task_handle, &xHigherPriorityTaskWoken);
+    }
+    
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// ========== UART Init ==========
 static void uart_init(void)
 {
     const uart_config_t cfg = {
@@ -73,10 +110,10 @@ static void uart_init(void)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
     uart_param_config(UART_PORT, &cfg);
-    uart_driver_install(UART_PORT, 256, 256, 0, NULL, 0);
+    uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0);
 }
 
-// ================== Encoder INIT ===================
+// ========== Encoder Init ==========
 static void encoder_init(void)
 {
     gpio_config_t io_conf = {
@@ -93,102 +130,335 @@ static void encoder_init(void)
     gpio_isr_handler_add(PIN_ENC_B, encoder_isr, NULL);
 }
 
-// ================== UART RX Task ===================
-// Espera [rpm_ref, target_frequency_hz]
-static void uart_rx_task(void *arg)
-{
-    uint16_t rx_buf[2];  // rx_buf[0]=rpm_ref, rx_buf[1]=frecuencia_hz
-    while (1) {
-        int len = uart_read_bytes(UART_PORT, (uint8_t *)rx_buf,
-                                  sizeof(rx_buf), pdMS_TO_TICKS(20));
-        if (len == sizeof(rx_buf)) {
-            g_rpm_ref = rx_buf[0];
-            uint16_t target_freq_hz = rx_buf[1];
+// ==========================================================
+// ==========    PWM TASK (NEW CONTROL LOGIC)   ==========
+// ==========================================================
+static void pwm_task(void* pv) {
+    pwm_task_config_t* cfg = (pwm_task_config_t*)pv;
+    ESP_LOGI(TAG, "PWM task start: %s", cfg->name_id);
+
+    // Determine complementary pin
+    gpio_num_t op_a = cfg->gpio_num;
+    gpio_num_t op_b = phases::A_LOW_GPIO;
+    if (cfg->pwm_timer == phases::PWM_TIMER_ID0) op_b = phases::A_LOW_GPIO;
+    else if (cfg->pwm_timer == phases::PWM_TIMER_ID1) op_b = phases::B_LOW_GPIO;
+    else op_b = phases::C_LOW_GPIO;
+
+    // Configure timer and pins
+    pwm_hal_configure_timer_and_pin(cfg, op_a, op_b);
+    pwm_hal_set_deadtime(cfg->pwm_unit, cfg->pwm_timer, 2, 2);
+
+    seq_t local_seq;
+    local_seq.len = 0;
+    QueueHandle_t my_cmd_queue = NULL;
+
+    // Assign the correct command queue
+    if (cfg->pwm_timer == phases::PWM_TIMER_ID0) my_cmd_queue = cmdQueueA;
+    else if (cfg->pwm_timer == phases::PWM_TIMER_ID1) my_cmd_queue = cmdQueueB;
+    else if (cfg->pwm_timer == phases::PWM_TIMER_ID2) my_cmd_queue = cmdQueueC;
+
+    // Calculate phase shift ONCE
+    uint32_t shift_int = 0;
+    if (cfg->phase_offset_deg == 120.0f) 
+        shift_int = (uint32_t)(phases::MAX_THETA_INT/3u);
+    else if (cfg->phase_offset_deg == 240.0f) 
+        shift_int = (uint32_t)((2u*phases::MAX_THETA_INT)/3u);
+
+    for (;;) {
+        // 1) Check for command sequence (non-blocking)
+        if (my_cmd_queue != NULL && xQueueReceive(my_cmd_queue, &local_seq, 0) == pdTRUE) {
             
-            // Aplicamos la frecuencia al driver del motor AC
-            phases::set_frequency((float)target_freq_hz);
+            // YES, we received a new command sequence
+            ESP_LOGI(TAG, "Task %s: Received sequence of %d steps", cfg->name_id, local_seq.len);
+            
+            for (uint8_t i = 0; i < local_seq.len; ++i) {
+                uint32_t value = local_seq.vals[i];
+
+                // --- MAIN CONTROL LOGIC ---
+                if (cfg->pwm_timer == phases::PWM_TIMER_ID0) {
+                    // CH1 = Frequency
+                    float freq_hz = (float)value;
+                    phases::set_frequency(freq_hz);
+                    ESP_LOGI(TAG, "Task %s: Frequency set to %.2f Hz", cfg->name_id, freq_hz);
+                
+                } else if (cfg->pwm_timer == phases::PWM_TIMER_ID1) {
+                    // CH2 = Amplitude
+                    float amp = (float)value / 100.0f;
+                    if (amp > 1.0f) amp = 1.0f;
+                    if (amp < 0.0f) amp = 0.0f;
+                    phases::set_amplitude(amp);
+                    ESP_LOGI(TAG, "Task %s: Amplitude set to %.2f %%", cfg->name_id, amp * 100.0f);
+                
+                } else {
+                    // CH3 = RPM Reference
+                    g_rpm_ref = (uint16_t)value;
+                    ESP_LOGI(TAG, "Task %s: RPM Ref set to %u", cfg->name_id, (unsigned)g_rpm_ref);
+                }
+                
+                // Wait T_PULSE_MS between sequence commands
+                vTaskDelay(pdMS_TO_TICKS(T_PULSE_MS));
+            }
+            local_seq.len = 0; // Clear sequence
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+
+        // 2) Check legacy float queue (non-blocking)
+        if (xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
+            if (duty_cmd < 0.0f) duty_cmd = 0.0f;
+            if (duty_cmd > 100.0f) duty_cmd = 100.0f;
+            cfg->duty_cycle = duty_cmd;
+            pwm_hal_set_duty_percent(cfg, duty_cmd);
+            
+            // Empty queue
+            while (xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
+                if (duty_cmd < 0.0f) duty_cmd = 0.0f;
+                if (duty_cmd > 100.0f) duty_cmd = 100.0f;
+                cfg->duty_cycle = duty_cmd;
+                pwm_hal_set_duty_percent(cfg, duty_cmd);
+            }
+            vTaskDelay(pdMS_TO_TICKS(T_PULSE_MS));
+            continue;
+        }
+
+        // 3) SPWM MODE - WAIT FOR TIMER ISR NOTIFICATION
+        // ✅ CRITICAL: This blocks until the ISR notifies
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        
+        // ISR woke us up. Calculate and apply SPWM duty
+        uint32_t theta = phases::phases_get_theta_int();
+        uint32_t theta_shifted = theta + shift_int;
+        
+        uint32_t raw = sin_lut(theta_shifted);
+        const uint32_t DUTYCYCLE_OFFSET = 16;
+        const uint32_t DUTYCYCLE_MASK_HIGH = 0xFFFF << DUTYCYCLE_OFFSET;
+        uint32_t duty_counts_high = (raw & DUTYCYCLE_MASK_HIGH) >> DUTYCYCLE_OFFSET;
+        
+        float pct = ((float)duty_counts_high / (float)PWM_MAX_VAL) * 100.0f;
+        pct *= phases::get_amplitude();
+        
+        if (pct < 0.0f) pct = 0.0f;
+        if (pct > 100.0f) pct = 100.0f;
+        
+        cfg->duty_cycle = pct;
+        pwm_hal_set_duty_percent(cfg, pct);
     }
 }
 
-// ================== RPM TX Task ===================
+// ========== UART RX Task ==========
+static void uart_rx_task(void *arg)
+{
+    const int RX_BUF = 512;
+    uint8_t* data = (uint8_t*)malloc(RX_BUF);
+    std::string line_buffer;
+
+    auto trim = [](std::string &str) {
+        while (!str.empty() && isspace((unsigned char)str.front()))
+            str.erase(0, 1);
+        while (!str.empty() && isspace((unsigned char)str.back()))
+            str.pop_back();
+    };
+
+    while (1) {
+        int len = uart_read_bytes(UART_PORT, data, RX_BUF - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            data[len] = '\0';
+            line_buffer += (char *)data;
+
+            size_t newline_pos;
+            while ((newline_pos = line_buffer.find('\n')) != std::string::npos) {
+                std::string cmd_line = line_buffer.substr(0, newline_pos);
+                line_buffer.erase(0, newline_pos + 1);
+
+                trim(cmd_line);
+                if (cmd_line.empty()) continue;
+
+                ESP_LOGI(TAG, "UART CMD: %s", cmd_line.c_str());
+
+                size_t space1 = cmd_line.find(' ');
+                if (space1 == std::string::npos) {
+                    ESP_LOGW(TAG, "Invalid format: Missing 'SET'");
+                    continue;
+                }
+                std::string token1 = cmd_line.substr(0, space1);
+
+                size_t space2 = cmd_line.find(' ', space1 + 1);
+                if (space2 == std::string::npos) {
+                    ESP_LOGW(TAG, "Invalid format: Missing channel or values");
+                    continue;
+                }
+                std::string token2 = cmd_line.substr(space1 + 1, space2 - space1 - 1);
+                std::string token3 = cmd_line.substr(space2 + 1);
+
+                trim(token1);
+                trim(token2);
+                trim(token3);
+
+                if (token1 != "SET") {
+                    ESP_LOGW(TAG, "Command must start with SET");
+                    continue;
+                }
+                
+                // Determine the correct command queue
+                QueueHandle_t target_cmd_queue = NULL;
+                if (token2 == "CH1" || token2 == "A")
+                    target_cmd_queue = cmdQueueA;
+                else if (token2 == "CH2" || token2 == "B")
+                    target_cmd_queue = cmdQueueB;
+                else if (token2 == "CH3" || token2 == "C")
+                    target_cmd_queue = cmdQueueC;
+
+                if (target_cmd_queue == NULL) {
+                    ESP_LOGW(TAG, "Invalid channel: %s", token2.c_str());
+                    continue;
+                }
+
+                // Parse sequence of values as uint32_t
+                seq_t seq;
+                seq.len = 0;
+
+                size_t start = 0;
+                while (start < token3.size() && seq.len < MAX_SEQ_LEN) {
+                    size_t end = token3.find(',', start);
+                    if (end == std::string::npos) end = token3.size();
+
+                    std::string val_str = token3.substr(start, end - start);
+                    trim(val_str);
+
+                    if (!val_str.empty()) {
+                        uint32_t value = strtoul(val_str.c_str(), NULL, 10);
+                        seq.vals[seq.len++] = value;
+                    }
+                    start = end + 1;
+                }
+
+                // Send the sequence to the command queue
+                if (seq.len == 0) {
+                    ESP_LOGW(TAG, "Empty sequence received for %s", token2.c_str());
+                } else {
+                    // Overwrite the queue with the new sequence
+                    BaseType_t ok = xQueueOverwrite(target_cmd_queue, &seq);
+                    if (ok == pdTRUE) {
+                        ESP_LOGI(TAG, "Sequence loaded to %s, %d steps", token2.c_str(), seq.len);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to write sequence to queue %s", token2.c_str());
+                    }
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ========== RPM TX Task ==========
 static void rpm_tx_task(void *arg)
 {
     const double Ts = SAMPLE_MS / 1000.0;
     double rpm_filt = 0.0;
-
+    const double RPM_MAX = 10000.0;
+    
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
-
-        long pulses;
+        
+        int32_t pulses;
         taskENTER_CRITICAL(&spinlock);
         pulses = g_pulse_count;
         g_pulse_count = 0;
         taskEXIT_CRITICAL(&spinlock);
-
+        
         double cycles = (double)pulses / 8.0;
         double revolutions = cycles / (double)PULSES_PER_REV;
         double rpm = fabs((revolutions / Ts) * 60.0);
-
         if (rpm > RPM_MAX) rpm = RPM_MAX;
-
+        
         rpm_filt = (ALPHA * rpm) + ((1.0 - ALPHA) * rpm_filt);
-
         uint16_t rpm_val = (uint16_t)rpm_filt;
+        
+        // Read g_rpm_ref (not critical, a 'dirty' read is fine)
+        uint16_t rpm_ref_snapshot = g_rpm_ref; 
+        
         uart_write_bytes(UART_PORT, (const char *)&rpm_val, sizeof(uint16_t));
-        uart_write_bytes(UART_PORT, (const char *)&g_rpm_ref, sizeof(uint16_t));
+        uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
 
-        // --- ¡AQUÍ LA PRUEBA DE SOFTWARE! ---
-        // Imprime la frecuencia que el módulo 'phases' cree que está generando
-        ESP_LOGI(TAG, "RPM(tx): %u, Freq(leida): %.2f Hz", rpm_val, phases::get_frequency());
+        // Uncomment for debugging
+        // ESP_LOGI(TAG, "RPM(tx): %u, Ref(tx): %u", rpm_val, rpm_ref_snapshot);
     }
 }
 
-// ================== MAIN ===================
+// ========== app_main ==========
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
-    
-    // --- INICIALIZACIÓN COMÚN ---
+
     uart_init();
     encoder_init();
 
-    ESP_LOGI(TAG, "Inicializando controlador de motor AC (Phases)...");
-    if (phases::init_phases()) {
-        ESP_LOGI(TAG, "Controlador AC inicializado.");
-        
-        phases::set_amplitude(1.0f); // Amplitud al 100%
-        phases::start_phases();      // Arranca los timers de PWM
-        
-    } else {
-        ESP_LOGE(TAG, "¡¡¡ ERROR FATAL al inicializar 'phases' !!!");
-        while(1) { vTaskDelay(1000); } // Detener
+    ESP_LOGI(TAG, "Initializing AC Motor Controller (Phases)...");
+    if (!phases::init_phases()) {
+        ESP_LOGE(TAG, "Error initializing phases");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
 
-// --- AQUÍ SE SELECCIONA EL MODO DE OPERACIÓN ---
+    pwm_hal_init();
+
+    // Configure PWM tasks
+    pwmA.pwm_unit = phases::MCPWM_UNIT_USED;
+    pwmA.pwm_timer = phases::PWM_TIMER_ID0;
+    pwmA.pwm_op = MCPWM_OPR_A;
+    pwmA.gpio_num = phases::A_HIGH_GPIO;
+    pwmA.phase_offset_deg = 0.0f;
+    pwmA.name_id = "CH1-Freq";
+    pwmA.queue = NULL; // Legacy queue no longer used
+
+    pwmB.pwm_unit = phases::MCPWM_UNIT_USED;
+    pwmB.pwm_timer = phases::PWM_TIMER_ID1;
+    pwmB.pwm_op = MCPWM_OPR_A;
+    pwmB.gpio_num = phases::B_HIGH_GPIO;
+    pwmB.phase_offset_deg = 120.0f;
+    pwmB.name_id = "CH2-Amp";
+    pwmB.queue = NULL;
+
+    pwmC.pwm_unit = phases::MCPWM_UNIT_USED;
+    pwmC.pwm_timer = phases::PWM_TIMER_ID2;
+    pwmC.pwm_op = MCPWM_OPR_A;
+    pwmC.gpio_num = phases::C_HIGH_GPIO;
+    pwmC.phase_offset_deg = 240.0f;
+    pwmC.name_id = "CH3-RPMRef";
+    pwmC.queue = NULL;
+
+    // Queues for command sequences (seq_t type)
+    cmdQueueA = xQueueCreate(1, sizeof(seq_t));
+    cmdQueueB = xQueueCreate(1, sizeof(seq_t));
+    cmdQueueC = xQueueCreate(1, sizeof(seq_t));
+
+    if (!cmdQueueA || !cmdQueueB || !cmdQueueC) {
+        ESP_LOGE(TAG, "Error creating command queues");
+        while(1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // Set initial values
+    phases::set_amplitude(1.0f); // Default amplitude
+    phases::set_frequency(0.0f); // Default frequency
+
 #if (RUN_TEST_MODE == 1)
-
-    // --- MODO DE PRUEBA ---
-    ESP_LOGW(TAG, "======== MODO DE PRUEBA ACTIVO ========");
-    ESP_LOGW(TAG, "Fijando frecuencia a 1.0 Hz para prueba de LED.");
-    ESP_LOGW(TAG, "Conecta un LED + Resistor al GPIO 5 (A_HIGH)");
+    ESP_LOGW(TAG, "Test mode active");
     phases::set_frequency(0.2f);
-    // No se inician las tareas de UART ni RPM, el sistema espera aquí.
-
 #else
-
-    // --- MODO REAL (UART) ---
-    ESP_LOGI(TAG, "======== MODO REAL (UART) ACTIVO ========");
-    ESP_LOGI(TAG, "Iniciando tareas de control por UART y telemetría de RPM.");
+    ESP_LOGI(TAG, "Real UART mode");
     
-    // Arrancamos con motor detenido hasta recibir comando
-    phases::set_frequency(0.0f); 
+    // Create tasks and save handles
+    // Core 0: UART, RPM, and PWM C (RPM Ref Control)
+    xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(rpm_tx_task, "rpm_tx", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(pwm_task, "pwmC", 4096, &pwmC, 5, &pwmC_task_handle, 0);
     
-    // Creamos las tareas de control
-    xTaskCreatePinnedToCore(uart_rx_task, "uart_rx_task", 2048, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(rpm_tx_task, "rpm_tx_task", 4096, NULL, 5, NULL, 1);
-
+    // Core 1: PWM A (SPWM) and PWM B (SPWM)
+    xTaskCreatePinnedToCore(pwm_task, "pwmA", 4096, &pwmA, 5, &pwmA_task_handle, 1);
+    xTaskCreatePinnedToCore(pwm_task, "pwmB", 4096, &pwmB, 5, &pwmB_task_handle, 1);
 #endif
+
+    // IMPORTANT: Start phases (timer ISR) AFTER creating the tasks
+    phases::start_phases();
+
+    ESP_LOGI(TAG, "app_main finished init");
 }

@@ -1,383 +1,276 @@
 /**
- * @file phases.cpp
- * @author ACMAX (you@domain.com)
- * @brief 
- * @version 0.1
- * @date 2025-02-21
- * * @copyright Copyright (c) 2025
- * */
+ * phases.cpp  -- MCPWM + theta management + PWM HAL (integrated)
+ * (Compatible with ESP-IDF v4.4)
+ * (Compatible with app_main notification architecture)
+ */
+
 #include "phases.hpp"
-
-#ifndef MCK_PHASE_MODULE
-
-#include <algorithm>
-
-#include "esp_log.h"
-
 #include "pwm.h"
+#include "esp_log.h"
+#include "driver/mcpwm.h" // LEGACY DRIVER (v4.4)
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include <cmath>
 
-using phases::M_TAU;
-using phases::MAX_THETA_INT;
-using phases::SINE_WAVE_SAMPLE_TIMEus;
-using phases::SINE_WAVE_SAMPLE_TIMEs;
-using phases::DEAD_TIME_nsX100;
-using phases::PWM_TIMER_ID;
-using phases::PWM_FREQUENCY_Hz;
+using namespace phases;
 
-using phases::A_HIGH_CHANNEL;
-using phases::A_LOW_CHANNEL;
-using phases::B_HIGH_CHANNEL;
-using phases::B_LOW_CHANNEL;
-using phases::C_HIGH_CHANNEL;
-using phases::C_LOW_CHANNEL;
+static const char LOG_TAG[] = "phases_hal";
 
-using phases::A_HIGH_GPIO;
-using phases::A_LOW_GPIO;
-using phases::B_HIGH_GPIO;
-using phases::B_LOW_GPIO;
-using phases::C_HIGH_GPIO;
-using phases::C_LOW_GPIO;
-
-using phases::POWER_ON_PIN;
-using phases::POWER_ON_GPIO;
-static constexpr uint32_t GPIO_HIGH = 1;
-static constexpr uint32_t GPIO_LOW  = 0;
-
-static const char LOG_TAG[] = "phases";
-
-static constexpr uint32_t SECOND_us     = 1000000;
-static constexpr uint32_t SECOND_ns     = SECOND_us*1000;
-static constexpr uint32_t SECOND_nsX100 = SECOND_ns/100;
-constexpr uint32_t DEAD_TIME = 2.0*DEAD_TIME_nsX100*PWM_FREQUENCY_Hz*PWM_MAX_VAL/SECOND_nsX100;
-constexpr uint32_t DEAD_TIME_2 = DEAD_TIME / 2;
-
-constexpr int DUTYCYCLE_OFFSET = 16;
-constexpr uint32_t DUTYCYCLE_MASK_LOW  = 0xFFFF;
-constexpr uint32_t DUTYCYCLE_MASK_HIGH = DUTYCYCLE_MASK_LOW<<DUTYCYCLE_OFFSET;
-constexpr uint32_t PLS_M_TAU_3_INT = MAX_THETA_INT/3;
-constexpr uint32_t MNS_M_TAU_3_INT = (~PLS_M_TAU_3_INT) + 1;
-
+// ==============================
+//  INTERNAL VARIABLES
+// ==============================
 static bool init_ok = false;
-bool phases::init_phases_ok(void) {return init_ok;}
+bool phases::init_phases_ok(void) { return init_ok; }
 
-static esp_timer_handle_t sine_generator_timer_handle;
+static esp_timer_handle_t sine_generator_timer_handle = nullptr;
 
-static float MAX_ANGULAR_SPEED_rads = 0.0f;
-static float MAX_FREQUENCY_hz = 0.0f;
-static uint32_t MAX_ANGULAR_SPEED_int = 0;
+static volatile uint32_t _A_theta_int = 0;
 static volatile uint32_t _angular_speed_int = 0;
 
-static volatile uint32_t div_fact  = PWM_MAX_VAL;
+static float g_amplitude = 1.0f;
+static uint32_t div_fact = PWM_MAX_VAL;
 
-enum PhaseSelector {A=0, B, C};
-inline void set_phase_dutycycle(PhaseSelector phase, uint32_t value);
+static uint32_t MAX_ANGULAR_SPEED_int = 0;
+static float MAX_ANGULAR_SPEED_rads = 0.0f;
+static float MAX_FREQUENCY_hz = 0.0f;
 
-void phases::phase_output_intr(void* args) {
-    static uint32_t A_theta = 0;
-    uint32_t angular_speed = _angular_speed_int;
+static constexpr uint32_t SINE_STEPS = SINE_LUT_IDX_RESOLUTION;
 
-    A_theta += angular_speed;
+// --- Notification function prototype ---
+// This function must exist in app_main.cpp
+extern void phases_notify_pwm_tasks_from_isr(void);
 
-    uint32_t A_dutycycle = sin_lut(A_theta                );
-    uint32_t B_dutycycle = sin_lut(A_theta+PLS_M_TAU_3_INT);
-    uint32_t C_dutycycle = sin_lut(A_theta+MNS_M_TAU_3_INT);
-
-    set_phase_dutycycle(A, A_dutycycle);
-    set_phase_dutycycle(B, B_dutycycle);
-    set_phase_dutycycle(C, C_dutycycle);
+// ==============================
+//  FORWARD UTILS
+// ==============================
+uint32_t phases::hz_to_delta_theta_int(float frequency_hz) {
+    return (uint32_t)std::ceil((double)frequency_hz * SINE_WAVE_SAMPLE_TIMEs * (double)MAX_THETA_INT);
+}
+uint32_t phases::w_to_delta_theta_int(float angular_speed_rads) {
+    return (uint32_t)std::ceil((double)angular_speed_rads * SINE_WAVE_SAMPLE_TIMEs * (double)MAX_THETA_INT / (double)M_TAU);
+}
+uint32_t phases::rad_to_theta_int(float x) {
+    while (x > M_TAU) x -= M_TAU;
+    while (x <  0.0f) x += M_TAU;
+    return (uint32_t)(x * (double)MAX_THETA_INT / (double)M_TAU);
 }
 
-inline void set_phase_dutycycle(PhaseSelector phase, uint32_t value) {
-    ledc_channel_t phase_component_h = A_HIGH_CHANNEL;
-    ledc_channel_t phase_component_l = A_LOW_CHANNEL;
-    switch (phase) {
-        case A:
-            phase_component_h = A_HIGH_CHANNEL;
-            phase_component_l = A_LOW_CHANNEL;
-            break;
-        case B:
-            phase_component_h = B_HIGH_CHANNEL;
-            phase_component_l = B_LOW_CHANNEL;
-            break;
-        case C:
-            phase_component_h = C_HIGH_CHANNEL;
-            phase_component_l = C_LOW_CHANNEL;
-            break;
+uint32_t phases::phases_get_theta_int(void) {
+    return _A_theta_int;
+}
+
+// ==============================
+//  TIMER ISR: increments theta AND NOTIFIES
+// ==============================
+void IRAM_ATTR phases::phase_output_intr(void* args) {
+    (void)args;
+    // 1. Increment Theta
+    _A_theta_int += _angular_speed_int;
+    
+    // 2. Notify PWM tasks that there is a new value
+    phases_notify_pwm_tasks_from_isr();
+}
+
+// ==============================
+//  INIT PHASES
+// ==============================
+bool phases::init_phases(void) {
+    esp_err_t err;
+
+    // power pin
+    gpio_config_t enable_pin_config = {
+        .pin_bit_mask = (1ULL << POWER_ON_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+
+    err = gpio_config(&enable_pin_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(LOG_TAG, "gpio_config error: %s", esp_err_to_name(err));
+        return false;
     }
-    uint32_t dutycycle_h = (value&DUTYCYCLE_MASK_HIGH)>>DUTYCYCLE_OFFSET;
-    uint32_t dutycycle_l = value&DUTYCYCLE_MASK_LOW;
+    gpio_set_level(POWER_ON_GPIO, 0);
 
-    dutycycle_h = dutycycle_h/div_fact;
-    dutycycle_l = dutycycle_l/div_fact;
-    ledc_set_duty_and_update(LEDC_HIGH_SPEED_MODE,
-        phase_component_h, std::min(dutycycle_h+DEAD_TIME_2, PWM_MAX_VAL), 0
-        // phase_component_h, dutycycle_h, 0
-    );
-    ledc_set_duty_and_update(LEDC_HIGH_SPEED_MODE,
-        phase_component_l, (dutycycle_l<DEAD_TIME_2)?0:(dutycycle_l-DEAD_TIME_2), DEAD_TIME/2
-        // phase_component_l, (dutycycle_l<DEAD_TIME)?0:(dutycycle_l-DEAD_TIME), DEAD_TIME/2
-        // phase_component_l, dutycycle_l, 0
-    );
+    MAX_ANGULAR_SPEED_rads = (M_TAU / SINE_WAVE_SAMPLE_TIMEs) * 0.9f;
+    MAX_FREQUENCY_hz = 0.9f / SINE_WAVE_SAMPLE_TIMEs;
+    MAX_ANGULAR_SPEED_int = w_to_delta_theta_int(MAX_ANGULAR_SPEED_rads);
+
+    // Create esp_timer for theta stepping
+    esp_timer_create_args_t sine_generator_timer_cfg = {
+        .callback = &phases::phase_output_intr, // <- Calls the ISR (which now notifies)
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_ISR,
+        .name = "theta_step",
+        .skip_unhandled_events = false
+    };
+    err = esp_timer_create(&sine_generator_timer_cfg, &sine_generator_timer_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(LOG_TAG, "Error creating timer: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    init_ok = true;
+    ESP_LOGI(LOG_TAG, "phases init ok");
+    return true;
 }
 
+void phases::start_phases(void) {
+    if (!init_ok) {
+        ESP_LOGE(LOG_TAG, "phases not initialized");
+        return;
+    }
+    // IMPORTANT! The timer is started AFTER creating the tasks
+    esp_err_t err = esp_timer_start_periodic(sine_generator_timer_handle, SINE_WAVE_SAMPLE_TIMEus);
+    if (err != ESP_OK) {
+        ESP_LOGE(LOG_TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
+        return;
+    }
+    gpio_set_level(POWER_ON_GPIO, 1);
+}
+
+void phases::stop_phases(void) {
+    if (sine_generator_timer_handle) {
+        esp_timer_stop(sine_generator_timer_handle);
+    }
+    gpio_set_level(POWER_ON_GPIO, 0);
+}
+
+void phases::kill_phases(void) {
+    stop_phases();
+    g_amplitude = 0.0f;
+}
+
+bool phases::is_active_phases(void) {
+    if (!sine_generator_timer_handle) return false;
+    return esp_timer_is_active(sine_generator_timer_handle);
+}
+
+// amplitude / frequency
 void phases::set_amplitude(const float amplitude) {
-    if (amplitude > 1.0f || amplitude < 0.0f) {
-        ESP_LOGE(LOG_TAG, "Invalid amplitude, out of range! Clipping");
+    if (amplitude < 0.0f) {
+        ESP_LOGE(LOG_TAG, "amplitude negative clipped");
+        g_amplitude = 0.0f;
+        return;
     }
-
-    div_fact  = std::ceil(1/amplitude);
+    if (amplitude > 1.0f) {
+        ESP_LOGW(LOG_TAG, "amplitude clipped to 1");
+        g_amplitude = 1.0f;
+    } else {
+        g_amplitude = amplitude;
+    }
+    div_fact = (g_amplitude == 0.0f) ? PWM_MAX_VAL : (uint32_t)std::ceil(1.0f / (double)g_amplitude);
 }
-float phases::get_amplitude(void) {
-    return 1/(float)div_fact;
-}
+float phases::get_amplitude(void) { return g_amplitude; }
 
 void phases::set_frequency(const float frequency_hz) {
     if (frequency_hz < 0.0f) {
-        ESP_LOGE(LOG_TAG, "Invalid frequency, negative! Clipping");
+        ESP_LOGE(LOG_TAG, "Invalid frequency negative");
         _angular_speed_int = 0;
+        return;
     }
-    if (frequency_hz > (MAX_ANGULAR_SPEED_rads/M_TAU)) {
-        ESP_LOGE(LOG_TAG, "Invalid frequency, too high! Clipping");
+    if (frequency_hz > MAX_FREQUENCY_hz) {
+        ESP_LOGW(LOG_TAG, "frequency clipped to max");
         _angular_speed_int = MAX_ANGULAR_SPEED_int;
         return;
     }
     _angular_speed_int = hz_to_delta_theta_int(frequency_hz);
 }
+
 void phases::set_angular_speed(const float angular_speed_rads) {
     if (angular_speed_rads < 0.0f) {
-        ESP_LOGE(LOG_TAG, "Invalid angular speed, negative! Clipping");
+        ESP_LOGE(LOG_TAG, "Invalid angular speed negative");
         _angular_speed_int = 0;
         return;
     }
     if (angular_speed_rads > MAX_ANGULAR_SPEED_rads) {
-        ESP_LOGE(LOG_TAG, "Invalid angular speed, too high! Clipping");
+        ESP_LOGW(LOG_TAG, "angular speed clipped");
         _angular_speed_int = MAX_ANGULAR_SPEED_int;
         return;
     }
     _angular_speed_int = w_to_delta_theta_int(angular_speed_rads);
 }
+
 float phases::get_angular_speed(void) {
-    return M_TAU*_angular_speed_int/(SINE_WAVE_SAMPLE_TIMEs*MAX_THETA_INT);
+    return M_TAU * (double)_angular_speed_int / (SINE_WAVE_SAMPLE_TIMEs * (double)MAX_THETA_INT);
 }
 float phases::get_frequency(void) {
-    return _angular_speed_int/(SINE_WAVE_SAMPLE_TIMEs*MAX_THETA_INT);
+    return (double)_angular_speed_int / (SINE_WAVE_SAMPLE_TIMEs * (double)MAX_THETA_INT);
 }
 
-void phases::start_phases(void) {
-    if (!init_ok) {
-        ESP_LOGE(LOG_TAG, "error on initialization, cannot start!");
-        return;
-    }
-    esp_err_t error_code = ESP_OK;
-    ESP_ERROR_CHECK_WITHOUT_ABORT( esp_timer_start_periodic(
-        sine_generator_timer_handle, SINE_WAVE_SAMPLE_TIMEus
-    ));
-    if (error_code != ESP_OK) {
-        ESP_LOGE( LOG_TAG,
-            "error starting phases: %s",
-            esp_err_to_name(error_code)
-        );
-        return;
-    }
-    gpio_set_level(POWER_ON_GPIO, GPIO_HIGH);
+// ============================================================================
+//   PWM HAL (legacy v4.4)
+// ============================================================================
+static const char *PWM_HAL_TAG = "pwm_hal_impl";
+
+esp_err_t pwm_hal_init(void) {
+    ESP_LOGI(PWM_HAL_TAG, "pwm_hal_init ok");
+    return ESP_OK;
 }
 
-void phases::stop_phases(void) {
-    esp_err_t error_code = ESP_OK;
-    gpio_set_level(POWER_ON_GPIO, GPIO_LOW);
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(sine_generator_timer_handle));
-    if (error_code != ESP_OK) {
-        ESP_LOGE( LOG_TAG,
-            "error stopping phases: %s",
-            esp_err_to_name(error_code)
-        );
+esp_err_t pwm_hal_configure_timer_and_pin(const pwm_task_config_t* cfg, gpio_num_t gpio_op_a, gpio_num_t gpio_op_b)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+
+    // map GPIOs per timer
+    if (cfg->pwm_timer == PWM_TIMER_ID0) {
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM0A, gpio_op_a);
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM0B, gpio_op_b);
+    } else if (cfg->pwm_timer == PWM_TIMER_ID1) {
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM1A, gpio_op_a);
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM1B, gpio_op_b);
+    } else {
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM2A, gpio_op_a);
+        mcpwm_gpio_init(cfg->pwm_unit, MCPWM2B, gpio_op_b);
     }
+
+    // configure timer
+    mcpwm_config_t pwm_config;
+    pwm_config.frequency = PWM_FREQUENCY_Hz;
+    pwm_config.cmpr_a = 0.0;
+    pwm_config.cmpr_b = 0.0;
+    pwm_config.counter_mode = MCPWM_UP_COUNTER;
+    pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+
+    esp_err_t err = mcpwm_init(cfg->pwm_unit, cfg->pwm_timer, &pwm_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(PWM_HAL_TAG, "mcpwm_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(PWM_HAL_TAG, "Configured MCPWM unit %d timer %d pins %d/%d",
+             (int)cfg->pwm_unit, (int)cfg->pwm_timer, (int)gpio_op_a, (int)gpio_op_b);
+
+    return ESP_OK;
 }
 
-void phases::kill_phases(void) {
-    esp_err_t error_code = ESP_OK;
-    gpio_set_level(POWER_ON_GPIO, GPIO_LOW);
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(sine_generator_timer_handle));
-    if (error_code != ESP_OK) {
-        ESP_LOGE( LOG_TAG,
-            "error stopping phases: %s",
-            esp_err_to_name(error_code)
-        );
+/**
+ * Legacy deadtime in many v4.4 variants: use mcpwm_deadtime_enable()
+ * red_ticks / fed_ticks here are passed as microseconds (common wrapper).
+ * Mode chosen: MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE (compatible variant)
+ */
+esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t red_us, uint32_t fed_us)
+{
+    // This is the correct constant that was in your functional code.
+    esp_err_t err = mcpwm_deadtime_enable(unit, timer, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, red_us, fed_us);
+    if (err != ESP_OK) {
+        ESP_LOGE(PWM_HAL_TAG, "mcpwm_deadtime_enable failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(PWM_HAL_TAG, "deadtime set unit:%d timer:%d red:%u fed:%u", (int)unit, (int)timer, (unsigned)red_us, (unsigned)fed_us);
     }
-    set_phase_dutycycle(A, 0);
-    set_phase_dutycycle(B, 0);
-    set_phase_dutycycle(C, 0);
-    set_amplitude(0);
+    return err;
 }
 
-bool phases::is_active_phases(void) {
-    return esp_timer_is_active(sine_generator_timer_handle);
-}
+esp_err_t pwm_hal_set_duty_percent(const pwm_task_config_t* cfg, float duty_percent)
+{
+    if (!cfg) return ESP_ERR_INVALID_ARG;
 
-static const char INIT_LOG_TAG[] = "phase_init";
+    if (duty_percent < 0.0f) duty_percent = 0.0f;
+    if (duty_percent > 100.0f) duty_percent = 100.0f;
 
-static inline bool init_phase_channel(
-    const PhaseSelector phase,
-    const ledc_channel_config_t channel_base_config
-) {
-    ESP_LOGI(INIT_LOG_TAG, "Configuring phase %c...", 'A'+phase);
-    ledc_channel_config_t channel_high_config = channel_base_config;
-    ledc_channel_config_t channel_low_config  = channel_base_config;
+    mcpwm_set_duty(cfg->pwm_unit, cfg->pwm_timer, cfg->pwm_op, duty_percent);
+    mcpwm_set_duty_type(cfg->pwm_unit, cfg->pwm_timer, cfg->pwm_op, MCPWM_DUTY_MODE_0);
 
-    switch (phase) {
-        case A:
-            channel_high_config.gpio_num = A_HIGH_GPIO;
-            channel_high_config.channel  = A_HIGH_CHANNEL;
-            channel_low_config.gpio_num  = A_LOW_GPIO;
-            channel_low_config.channel   = A_LOW_CHANNEL;
-            break;
-        case B:
-            channel_high_config.gpio_num = B_HIGH_GPIO;
-            channel_high_config.channel  = B_HIGH_CHANNEL;
-            channel_low_config.gpio_num  = B_LOW_GPIO;
-            channel_low_config.channel   = B_LOW_CHANNEL;
-            break;
-        case C:
-            channel_high_config.gpio_num = C_HIGH_GPIO;
-            channel_high_config.channel  = C_HIGH_CHANNEL;
-            channel_low_config.gpio_num  = C_LOW_GPIO;
-            channel_low_config.channel   = C_LOW_CHANNEL;
-            break;
-    }
-    channel_high_config.flags.output_invert = 1;
-
-    esp_err_t error_code = ESP_OK;
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(ledc_channel_config(&channel_high_config));
-    if (error_code != ESP_OK) {
-        ESP_LOGE( INIT_LOG_TAG,
-            "Error configuring phase %c high, ERRCODE:\n%s",
-            phase, esp_err_to_name(error_code));
-        return false;
-    }
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(ledc_channel_config(&channel_low_config));
-    if (error_code != ESP_OK) {
-        ESP_LOGE( INIT_LOG_TAG,
-            "Error configuring phase %c low, ERRCODE:\n%s",
-            phase, esp_err_to_name(error_code));
-        return false;
-    }
-    ESP_LOGI(INIT_LOG_TAG, "Phase %c configured!", 'A'+phase);
-
-    init_ok = true;
-    return true;
-}
-
-bool phases::init_phases(void) {
-    esp_err_t error_code = ESP_OK;
-    gpio_config_t enable_pin_config = {
-        .pin_bit_mask = 1<<POWER_ON_PIN,
-        .mode         = gpio_mode_t::GPIO_MODE_OUTPUT,
-        .pull_up_en   = gpio_pullup_t::GPIO_PULLUP_DISABLE,
-        .pull_down_en = gpio_pulldown_t::GPIO_PULLDOWN_DISABLE,
-        .intr_type    = gpio_int_type_t::GPIO_INTR_DISABLE
-    };
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&enable_pin_config));
-    gpio_set_level(POWER_ON_GPIO, GPIO_LOW);
-
-    ESP_LOGI(INIT_LOG_TAG, "Creating sine sampler...");
-
-    esp_timer_create_args_t sine_generator_timer_cfg {
-        .callback              = phase_output_intr,
-        .arg                   = (void*)nullptr,
-        .dispatch_method       = ESP_TIMER_TASK, // <-- ARREGLO 1 (Línea 289)
-        .name                  = "SINE GEN",
-        .skip_unhandled_events = false
-    };
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(
-        &sine_generator_timer_cfg,
-        &sine_generator_timer_handle
-    )); if (error_code != ESP_OK) return false;
-    ESP_LOGI(INIT_LOG_TAG, "Sine sampler created!");
-
-    MAX_ANGULAR_SPEED_rads = (M_TAU/SINE_WAVE_SAMPLE_TIMEs)*0.9;
-    MAX_FREQUENCY_hz       = 0.9/SINE_WAVE_SAMPLE_TIMEs;
-    MAX_ANGULAR_SPEED_int  = w_to_delta_theta_int(MAX_ANGULAR_SPEED_rads);
-    ESP_LOGI(INIT_LOG_TAG, "Maximum angular speed: %.3erad/s", MAX_ANGULAR_SPEED_rads);
-    ESP_LOGI(INIT_LOG_TAG, "Maximum frequency    : %.3eHz", MAX_FREQUENCY_hz);
-    ESP_LOGI(INIT_LOG_TAG, "Configured dead time(us)   : %.3f", DEAD_TIME_nsX100/10.0);
-    ESP_LOGI(INIT_LOG_TAG, "Configured dead time(pwmdc): %ld", DEAD_TIME);
-    
-    ESP_LOGI(INIT_LOG_TAG, "Configuring PWM timer...");
-    ledc_timer_config_t pwm_timer_config = {
-        .speed_mode      = LEDC_HIGH_SPEED_MODE,
-        .duty_resolution = (ledc_timer_bit_t)PWM_RESOLUTION,
-        .timer_num       = PWM_TIMER_ID,
-        .freq_hz         = PWM_FREQUENCY_Hz,
-        .clk_cfg         = LEDC_USE_APB_CLK,
-        .deconfigure     = false
-    };
-    uint32_t suitable_res = ledc_find_suitable_duty_resolution(APB_CLK_FREQ, PWM_FREQUENCY_Hz);
-    error_code = ESP_ERROR_CHECK_WITHOUT_ABORT(ledc_timer_config(&pwm_timer_config));
-    if (suitable_res > PWM_RESOLUTION) {
-        ESP_LOGW(INIT_LOG_TAG, "You can increase the resolution to %ld", suitable_res);
-    }
-    if (error_code != ESP_OK) {
-        ESP_LOGW(INIT_LOG_TAG, "With a frequency of %ldHz, a resolution of %ld is needed", PWM_FREQUENCY_Hz, suitable_res);
-        return false;
-    }
-    ESP_LOGI(INIT_LOG_TAG, "PWM timer configured!");
-
-    ledc_channel_config_t channel_base_config = {
-        .gpio_num   = 0,
-        .speed_mode = LEDC_HIGH_SPEED_MODE,
-        .channel    = (ledc_channel_t)0,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .timer_sel  = PWM_TIMER_ID,
-        .duty       = 0x0F,
-        .hpoint     = 0,
-        .flags = {.output_invert = 0}
-    };
-
-    ESP_LOGI(INIT_LOG_TAG, "Configuring phase channels...");
-
-    bool init_ok = false;
-    init_ok = init_phase_channel(A, channel_base_config);
-    if (!init_ok) return false;
-    init_ok = init_phase_channel(B, channel_base_config);
-    if (!init_ok) return false;
-    init_ok = init_phase_channel(C, channel_base_config);
-    if (!init_ok) return false;
-
-
-    // --- ARREGLO 2 (Línea ~368) ---
-    // La función ledc_set_duty_and_update() requiere que el 
-    // servicio "fade" esté instalado, incluso si no lo usamos para desvanecer.
-    esp_err_t fade_err = ledc_fade_func_install(0);
-    if (fade_err != ESP_OK) {
-        ESP_LOGE(INIT_LOG_TAG, "Error installing fade service: %s", esp_err_to_name(fade_err));
-        return false;
-    }
-    // --- FIN DEL ARREGLO ---
-
-
-    return true;
-}
-
-#endif // MCK_PHASE_MODULE
-
-uint32_t phases::hz_to_delta_theta_int(float frequency_hz) {
-    using phases::SINE_WAVE_SAMPLE_TIMEs;
-    using phases::MAX_THETA_INT;
-
-    return std::ceil(frequency_hz*SINE_WAVE_SAMPLE_TIMEs*MAX_THETA_INT);
-}
-uint32_t phases::w_to_delta_theta_int(float angular_speed_rads) {
-    using phases::SINE_WAVE_SAMPLE_TIMEs;
-    using phases::MAX_THETA_INT;
-    using phases::M_TAU;
-
-    return std::ceil(angular_speed_rads*SINE_WAVE_SAMPLE_TIMEs*MAX_THETA_INT/M_TAU);
-}
-uint32_t phases::rad_to_theta_int(float x) {
-    using phases::M_TAU;
-    using phases::MAX_THETA_INT;
-
-    while (x > M_TAU) x -= M_TAU;
-    while (x <  0.0f) x += M_TAU;
-    return (uint32_t)(x*MAX_THETA_INT/M_TAU);
+    return ESP_OK;
 }
