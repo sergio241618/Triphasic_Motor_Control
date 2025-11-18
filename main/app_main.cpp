@@ -1,15 +1,18 @@
-/**
- * main/app_main.cpp
+/** main/app_main.cpp
  * PID CONTROL VERSION (Frequency/Amplitude via UART)
  * - Notification-based architecture
  * - Timer ISR notifies tasks to update SPWM
  * - UART receives Frequency (CH1), Amplitude (CH2), RPM_Ref (CH3)
+ *
+ * Fixes applied: declare duty_cmd, guard cfg->queue before xQueueReceive,
+ * uart_config_t zero-init to remove missing-field warnings.
  */
 
 #include <stdio.h>
 #include <string>
 #include <math.h>
-#include <stdlib.h> 
+#include <stdlib.h>
+#include <string.h>               // <-- for memset
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -102,13 +105,14 @@ void phases_notify_pwm_tasks_from_isr(void)
 // ========== UART Init ==========
 static void uart_init(void)
 {
-    const uart_config_t cfg = {
-        .baud_rate = UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    };
+    uart_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));  // avoid missing-initializer warnings
+    cfg.baud_rate = UART_BAUD;
+    cfg.data_bits = UART_DATA_8_BITS;
+    cfg.parity    = UART_PARITY_DISABLE;
+    cfg.stop_bits = UART_STOP_BITS_1;
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    // rx_flow_ctrl_thresh left 0 (unused because flow_ctrl disabled)
     uart_param_config(UART_PORT, &cfg);
     uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0);
 }
@@ -164,6 +168,9 @@ static void pwm_task(void* pv) {
     else if (cfg->phase_offset_deg == 240.0f) 
         shift_int = (uint32_t)((2u*phases::MAX_THETA_INT)/3u);
 
+    // ====== FIXED: declare duty_cmd and guard access to cfg->queue ======
+    float duty_cmd = 0.0f;
+
     for (;;) {
         // 1) Check for command sequence (non-blocking)
         if (my_cmd_queue != NULL && xQueueReceive(my_cmd_queue, &local_seq, 0) == pdTRUE) {
@@ -201,15 +208,15 @@ static void pwm_task(void* pv) {
             local_seq.len = 0; // Clear sequence
         }
 
-        // 2) Check legacy float queue (non-blocking)
-        if (xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
+        // 2) Check legacy float queue (non-blocking) -- guarded
+        if (cfg->queue && xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
             if (duty_cmd < 0.0f) duty_cmd = 0.0f;
             if (duty_cmd > 100.0f) duty_cmd = 100.0f;
             cfg->duty_cycle = duty_cmd;
             pwm_hal_set_duty_percent(cfg, duty_cmd);
             
             // Empty queue
-            while (xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
+            while (cfg->queue && xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
                 if (duty_cmd < 0.0f) duty_cmd = 0.0f;
                 if (duty_cmd > 100.0f) duty_cmd = 100.0f;
                 cfg->duty_cycle = duty_cmd;
@@ -378,9 +385,6 @@ static void rpm_tx_task(void *arg)
         
         uart_write_bytes(UART_PORT, (const char *)&rpm_val, sizeof(uint16_t));
         uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
-
-        // Uncomment for debugging
-        // ESP_LOGI(TAG, "RPM(tx): %u, Ref(tx): %u", rpm_val, rpm_ref_snapshot);
     }
 }
 
