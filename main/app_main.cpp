@@ -166,9 +166,6 @@ static void pwm_task(void* pv) {
 
     float duty_cmd = 0.0f;
 
-    // ====== FIXED: declare duty_cmd and guard access to cfg->queue ======
-    float duty_cmd = 0.0f;
-
     for (;;) {
         // 1) Check for command sequence
         if (my_cmd_queue != NULL && xQueueReceive(my_cmd_queue, &local_seq, 0) == pdTRUE) {
