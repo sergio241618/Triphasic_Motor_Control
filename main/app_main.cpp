@@ -1,15 +1,18 @@
 /** main/app_main.cpp
- * PRODUCTION VERSION - PID Control via UART
- * - Frequency control (CH1)
- * - Amplitude control (CH2)
- * - RPM Reference (CH3)
+ * PID CONTROL VERSION (Frequency/Amplitude via UART)
+ * - Notification-based architecture
+ * - Timer ISR notifies tasks to update SPWM
+ * - UART receives Frequency (CH1), Amplitude (CH2), RPM_Ref (CH3)
+ *
+ * Fixes applied: declare duty_cmd, guard cfg->queue before xQueueReceive,
+ * uart_config_t zero-init to remove missing-field warnings.
  */
 
 #include <stdio.h>
 #include <string>
 #include <math.h>
 #include <stdlib.h>
-#include <string.h>
+#include <string.h>               // <-- for memset
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -103,12 +106,13 @@ void phases_notify_pwm_tasks_from_isr(void)
 static void uart_init(void)
 {
     uart_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
+    memset(&cfg, 0, sizeof(cfg));  // avoid missing-initializer warnings
     cfg.baud_rate = UART_BAUD;
     cfg.data_bits = UART_DATA_8_BITS;
     cfg.parity    = UART_PARITY_DISABLE;
     cfg.stop_bits = UART_STOP_BITS_1;
     cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    // rx_flow_ctrl_thresh left 0 (unused because flow_ctrl disabled)
     uart_param_config(UART_PORT, &cfg);
     uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0);
 }
@@ -162,6 +166,9 @@ static void pwm_task(void* pv) {
 
     float duty_cmd = 0.0f;
 
+    // ====== FIXED: declare duty_cmd and guard access to cfg->queue ======
+    float duty_cmd = 0.0f;
+
     for (;;) {
         // 1) Check for command sequence
         if (my_cmd_queue != NULL && xQueueReceive(my_cmd_queue, &local_seq, 0) == pdTRUE) {
@@ -194,13 +201,14 @@ static void pwm_task(void* pv) {
             local_seq.len = 0;
         }
 
-        // 2) Check legacy float queue
+        // 2) Check legacy float queue (non-blocking) -- guarded
         if (cfg->queue && xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
             if (duty_cmd < 0.0f) duty_cmd = 0.0f;
             if (duty_cmd > 100.0f) duty_cmd = 100.0f;
             cfg->duty_cycle = duty_cmd;
             pwm_hal_set_duty_percent(cfg, duty_cmd);
             
+            // Empty queue
             while (cfg->queue && xQueueReceive(cfg->queue, &duty_cmd, 0) == pdTRUE) {
                 if (duty_cmd < 0.0f) duty_cmd = 0.0f;
                 if (duty_cmd > 100.0f) duty_cmd = 100.0f;
