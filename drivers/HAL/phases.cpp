@@ -7,7 +7,7 @@
 #include "phases.hpp"
 #include "pwm.h"
 #include "esp_log.h"
-#include "driver/mcpwm.h" // LEGACY DRIVER (v4.4)
+#include "driver/mcpwm.h" 
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include <cmath>
@@ -200,7 +200,7 @@ float phases::get_frequency(void) {
 }
 
 // ============================================================================
-//   PWM HAL (legacy v4.4)
+//   PWM HAL
 // ============================================================================
 static const char *PWM_HAL_TAG = "pwm_hal_impl";
 
@@ -245,19 +245,19 @@ esp_err_t pwm_hal_configure_timer_and_pin(const pwm_task_config_t* cfg, gpio_num
     return ESP_OK;
 }
 
-/**
- * Legacy deadtime in many v4.4 variants: use mcpwm_deadtime_enable()
- * red_ticks / fed_ticks here are passed as microseconds (common wrapper).
- * Mode chosen: MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE (compatible variant)
- */
 esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t red_us, uint32_t fed_us)
 {
-    // This is the correct constant that was in your functional code.
-    esp_err_t err = mcpwm_deadtime_enable(unit, timer, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, red_us, fed_us);
+    uint32_t factor = 19; 
+
+    uint32_t red_ticks = red_us * factor;
+    uint32_t fed_ticks = fed_us * factor;
+
+    esp_err_t err = mcpwm_deadtime_enable(unit, timer, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, red_ticks, fed_ticks);
+    
     if (err != ESP_OK) {
         ESP_LOGE(PWM_HAL_TAG, "mcpwm_deadtime_enable failed: %s", esp_err_to_name(err));
     } else {
-        ESP_LOGI(PWM_HAL_TAG, "deadtime set unit:%d timer:%d red:%u fed:%u", (int)unit, (int)timer, (unsigned)red_us, (unsigned)fed_us);
+        ESP_LOGI(PWM_HAL_TAG, "deadtime set: %u us -> %u ticks (Factor: %u)", (unsigned)red_us, (unsigned)red_ticks, (unsigned)factor);
     }
     return err;
 }

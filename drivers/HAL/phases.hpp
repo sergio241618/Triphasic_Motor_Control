@@ -28,7 +28,7 @@ constexpr mcpwm_unit_t MCPWM_UNIT_USED = MCPWM_UNIT_0;
 constexpr mcpwm_timer_t PWM_TIMER_ID0 = MCPWM_TIMER_0;
 constexpr mcpwm_timer_t PWM_TIMER_ID1 = MCPWM_TIMER_1;
 constexpr mcpwm_timer_t PWM_TIMER_ID2 = MCPWM_TIMER_2;
-constexpr uint32_t PWM_FREQUENCY_Hz = 20000u; // carrier
+constexpr uint32_t PWM_FREQUENCY_Hz = 20000u;
 
 // pins (adjust to your board)
 constexpr gpio_num_t A_HIGH_GPIO = (gpio_num_t)5;
