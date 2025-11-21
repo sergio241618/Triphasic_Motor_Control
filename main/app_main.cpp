@@ -22,7 +22,7 @@
 #define TAG "MOTOR_AC_UART"
 
 // Encoder pins
-#define PIN_ENC_A GPIO_NUM_14
+#define PIN_ENC_A GPIO_NUM_13
 #define PIN_ENC_B GPIO_NUM_15
 
 // UART
@@ -150,7 +150,7 @@ static void pwm_task(void *pv)
         op_b = phases::C_LOW_GPIO;
 
     pwm_hal_configure_timer_and_pin(cfg, op_a, op_b);
-    pwm_hal_set_deadtime(cfg->pwm_unit, cfg->pwm_timer, 1, 1);
+    pwm_hal_set_deadtime(cfg->pwm_unit, cfg->pwm_timer, 500, 500);
 
     seq_t local_seq;
     local_seq.len = 0;
@@ -459,7 +459,7 @@ extern "C" void app_main(void)
 
     // Initialize motor
     phases::set_amplitude(1.0f);
-    phases::set_frequency(1.0f);
+    phases::set_frequency(20.0f);
 
     // Create tasks
     xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL, 0);

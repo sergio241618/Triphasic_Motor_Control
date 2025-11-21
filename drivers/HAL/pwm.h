@@ -24,7 +24,7 @@ typedef struct {
 // HAL functions (implemented inside phases.cpp)
 esp_err_t pwm_hal_init(void);
 esp_err_t pwm_hal_configure_timer_and_pin(const pwm_task_config_t* cfg, gpio_num_t gpio_op_a, gpio_num_t gpio_op_b);
-esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t red_ticks, uint32_t fed_ticks);
+esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t red_ns, uint32_t fed_ns);
 esp_err_t pwm_hal_set_duty_percent(const pwm_task_config_t* cfg, float duty_percent);
 
 #ifdef __cplusplus

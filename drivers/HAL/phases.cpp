@@ -245,20 +245,29 @@ esp_err_t pwm_hal_configure_timer_and_pin(const pwm_task_config_t* cfg, gpio_num
     return ESP_OK;
 }
 
-esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t red_us, uint32_t fed_us)
+esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer, 
+                                uint32_t red_ns, uint32_t fed_ns)
 {
-    uint32_t factor = 19; 
-
-    uint32_t red_ticks = red_us * factor;
-    uint32_t fed_ticks = fed_us * factor;
-
-    esp_err_t err = mcpwm_deadtime_enable(unit, timer, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, red_ticks, fed_ticks);
+    const uint32_t PWM_FREQ = PWM_FREQUENCY_Hz; 
+    const uint32_t TICKS_PER_PERIOD = 1000;
+    
+    // ns por tick
+    uint32_t ns_per_tick = (1000000000UL / PWM_FREQ) / TICKS_PER_PERIOD;
+    
+    // Convertir nanosegundos a ticks
+    uint32_t red_ticks = (red_ns + ns_per_tick - 1) / ns_per_tick;  // Round up
+    uint32_t fed_ticks = (fed_ns + ns_per_tick - 1) / ns_per_tick;
+    
+    ESP_LOGI(PWM_HAL_TAG, "Deadtime: %u ns -> %u ticks (rising)", red_ns, red_ticks);
+    ESP_LOGI(PWM_HAL_TAG, "Deadtime: %u ns -> %u ticks (falling)", fed_ns, fed_ticks);
+    
+    esp_err_t err = mcpwm_deadtime_enable(unit, timer, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, 
+                                          red_ticks, fed_ticks);
     
     if (err != ESP_OK) {
         ESP_LOGE(PWM_HAL_TAG, "mcpwm_deadtime_enable failed: %s", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(PWM_HAL_TAG, "deadtime set: %u us -> %u ticks (Factor: %u)", (unsigned)red_us, (unsigned)red_ticks, (unsigned)factor);
     }
+    
     return err;
 }
 

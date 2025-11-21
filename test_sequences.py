@@ -5,10 +5,10 @@ from mcu_comms import connect_to_esp32, send_command
 
 # --- Sequence Configuration ---
 # CH1 = Frequency (Hz)
-SEQ_CH1 = "0,10,20,30,40,50,60,50,40,30,20,10,0"
+SEQ_CH1 = "50,100,150,200,250,200,150,100,50,50,100,150,200,250,200,150,100,50"
 
 # CH2 = Amplitude (0-100)
-SEQ_CH2 = "100,80,60,40,20"
+SEQ_CH2 = "100,80,60,40,20,0,20,40,60,80,100"
 
 # CH3 = RPM Reference (RPM)
 SEQ_CH3 = "1000,2000,3000,1500"
