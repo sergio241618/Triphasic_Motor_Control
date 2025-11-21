@@ -460,6 +460,11 @@ extern "C" void app_main(void)
     // Initialize motor
     phases::set_amplitude(1.0f);
     phases::set_frequency(20.0f);
+    
+    // Configure slew rate for smooth frequency transitions
+    //   - Lower (10-20 Hz/s): Smoother, better for plant modeling
+    //   - Higher (50-100 Hz/s): Faster response, more dynamic
+    phases::set_frequency_slew_rate(30.0f);
 
     // Create tasks
     xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL, 0);

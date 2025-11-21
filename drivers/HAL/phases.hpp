@@ -58,6 +58,11 @@ void set_angular_speed(const float angular_speed_rads);
 float get_angular_speed(void);
 float get_frequency(void);
 
+// Frequency slew rate limiter (rampa de frecuencia)
+void set_frequency_slew_rate(float hz_per_second);
+float get_frequency_slew_rate(void);
+float get_target_frequency(void);
+
 // utilities
 uint32_t hz_to_delta_theta_int(float frequency_hz);
 uint32_t w_to_delta_theta_int(float angular_speed_rads);
