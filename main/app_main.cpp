@@ -23,15 +23,15 @@
 // ========== MODE SELECTION ==========
 // Set to 1 for Python debug mode (text commands: "SET CH1 20")
 // Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
-#define PYTHON_DEBUG 0
+#define PYTHON_DEBUG 1
 
 // Set to 1 for plant modeling mode (logs: Time, Frequency, RPM)
 // Set to 0 for normal operation
-#define PLANT_MODELING 1
+#define PLANT_MODELING 0
 
 // Set to 1 to generate internal ramp (no Simulink needed)
 // Set to 0 to receive frequency from Simulink
-#define INTERNAL_RAMP 1
+#define INTERNAL_RAMP 0
 
 #define TAG "MOTOR_AC_UART"
 
@@ -463,10 +463,6 @@ static void simulink_rx_task(void *arg)
                 g_current_freq = freq_hz;  // Store for plant modeling
                 phases::set_frequency(freq_hz);
                 
-                #if PLANT_MODELING == 0
-                    ESP_LOGI(TAG, "Simulink RX: RPM_ref=%u, Freq=%.1f Hz", rpm_ref_rx, freq_hz);
-                #endif
-                
                 buf_idx = 0; // Reset buffer
             }
         }
@@ -513,10 +509,6 @@ static void rpm_tx_task(void *arg)
 
         uint16_t rpm_measured = (uint16_t)g_filtered_rpm;
         uint16_t rpm_ref_snapshot = g_rpm_ref;
-
-        // Send binary data: [rpm_measured, rpm_ref] as uint16
-        uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
-        uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
         
         #if PLANT_MODELING == 1
             // Plant modeling mode: Print CSV format (Time, Frequency, RPM)
@@ -525,9 +517,9 @@ static void rpm_tx_task(void *arg)
             printf("%.2f,%.2f,%.2f\n", time_s, freq_snapshot, g_filtered_rpm);
             fflush(stdout);  // Force immediate output
         #else
-            // Normal operation: Log RPM measured and reference
-            ESP_LOGI(TAG, "RPM: Measured=%u, Reference=%u", 
-                     rpm_measured, rpm_ref_snapshot);
+            // Normal operation: Send binary uint16 data [rpm_ref, rpm_measured] to Simulink
+            uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
+            uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
         #endif
         
         time_ms += SAMPLE_MS;
