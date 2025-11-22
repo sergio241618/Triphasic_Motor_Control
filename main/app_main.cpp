@@ -16,8 +16,14 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "soc/gpio_struct.h"  // For direct GPIO register access (GPIO.in)
 #include "phases.hpp"
 #include "pwm.h"
+
+// ========== MODE SELECTION ==========
+// Set to 1 for Python debug mode (text commands: "SET CH1 20")
+// Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
+#define PYTHON_DEBUG 1
 
 #define TAG "MOTOR_AC_UART"
 
@@ -46,6 +52,8 @@ typedef struct
 
 // Globals
 static volatile int32_t g_pulse_count = 0;
+static volatile uint32_t g_isr_count = 0;  // Debug: count ISR calls
+static volatile uint32_t g_last_isr_us = 0;  // For debouncing
 static volatile uint8_t old_AB = 0;
 static const int8_t QEM[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 static volatile uint16_t g_rpm_ref = 0;
@@ -69,17 +77,33 @@ static QueueHandle_t cmdQueueC = NULL;
 constexpr uint32_t PLS_M_TAU_3_INT = phases::MAX_THETA_INT / 3u; // +120°
 constexpr uint32_t MNS_M_TAU_3_INT = (~PLS_M_TAU_3_INT) + 1u;    // +240°
 
-
-// ========== Encoder ISR ==========
+// ========== Encoder ISR (Arduino-style: single interrupt on PIN_A) ==========
 static void IRAM_ATTR encoder_isr(void *arg)
 {
+    // Debounce: ignore interrupts too close together (3us minimum)
+    const uint32_t DEBOUNCE_US = 3;
+    uint32_t now_us = esp_timer_get_time();
+    
+    if ((now_us - g_last_isr_us) < DEBOUNCE_US) {
+        return;  // Too soon, ignore
+    }
+    g_last_isr_us = now_us;
+    
     portENTER_CRITICAL_ISR(&spinlock);
-    int state_A = gpio_get_level(PIN_ENC_A);
-    int state_B = gpio_get_level(PIN_ENC_B);
-    old_AB <<= 2;
-    uint8_t new_AB = (state_A << 1) | state_B;
-    old_AB |= new_AB;
-    g_pulse_count += QEM[old_AB & 0x0F];
+    
+    g_isr_count++;  // Debug: count ISR calls
+    
+    // Fast GPIO read - read PIN_B state
+    uint32_t gpio_in = GPIO.in;
+    uint8_t state_B = (gpio_in >> PIN_ENC_B) & 1;
+    
+    // Increment or decrement based on PIN_B state
+    if (state_B == 0) {
+        g_pulse_count++;
+    } else {
+        g_pulse_count--;
+    }
+    
     portEXIT_CRITICAL_ISR(&spinlock);
 }
 
@@ -127,11 +151,37 @@ static void encoder_init(void)
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_ANYEDGE};
-    gpio_config(&io_conf);
+    
+    esp_err_t err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Encoder GPIO config failed: %s", esp_err_to_name(err));
+        return;
+    }
+    
     old_AB = ((gpio_get_level(PIN_ENC_A) << 1) | gpio_get_level(PIN_ENC_B));
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(PIN_ENC_A, encoder_isr, NULL);
-    gpio_isr_handler_add(PIN_ENC_B, encoder_isr, NULL);
+    
+    // Install ISR service if not already installed
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to install ISR service: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Add ISR handlers
+    err = gpio_isr_handler_add(PIN_ENC_A, encoder_isr, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add ISR for PIN_A: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    err = gpio_isr_handler_add(PIN_ENC_B, encoder_isr, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add ISR for PIN_B: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Encoder initialized: PIN_A=%d, PIN_B=%d, initial_state=%d", 
+             PIN_ENC_A, PIN_ENC_B, old_AB);
 }
 
 // ========== PWM TASK ==========
@@ -211,7 +261,8 @@ static void pwm_task(void *pv)
                     ESP_LOGI(TAG, "RPM Ref: %u", (unsigned)g_rpm_ref);
                 }
 
-                vTaskDelay(pdMS_TO_TICKS(T_PULSE_MS));
+                // Don't delay here - continue PWM generation immediately
+                // to maintain continuous sinusoidal waveform
             }
             local_seq.len = 0;
         }
@@ -357,6 +408,50 @@ static void uart_rx_task(void *arg)
     }
 }
 
+// ========== SIMULINK RX Task (Binary Protocol) ==========
+#if PYTHON_DEBUG == 0
+static void simulink_rx_task(void *arg)
+{
+    const int RX_BUF = 128;
+    uint8_t *data = (uint8_t *)malloc(RX_BUF);
+    uint8_t buffer[4]; // Buffer for 2 x uint16 = 4 bytes
+    uint8_t buf_idx = 0;
+
+    ESP_LOGI(TAG, "Simulink RX task started - waiting for [rpm_ref, freq] as uint16");
+
+    while (1)
+    {
+        int len = uart_read_bytes(UART_PORT, data, RX_BUF, pdMS_TO_TICKS(20));
+        
+        for (int i = 0; i < len; i++)
+        {
+            buffer[buf_idx++] = data[i];
+            
+            // When we have 4 bytes (2 x uint16), process them
+            if (buf_idx >= 4)
+            {
+                // Parse: [rpm_ref_u16, freq_u16]
+                uint16_t rpm_ref_rx = (uint16_t)(buffer[0] | (buffer[1] << 8));
+                uint16_t freq_rx = (uint16_t)(buffer[2] | (buffer[3] << 8));
+                
+                // Update RPM reference
+                g_rpm_ref = rpm_ref_rx;
+                
+                // Update frequency (already limited to 20-60 Hz in set_frequency)
+                float freq_hz = (float)freq_rx;
+                phases::set_frequency(freq_hz);
+                
+                ESP_LOGI(TAG, "Simulink RX: RPM_ref=%u, Freq=%.1f Hz", rpm_ref_rx, freq_hz);
+                
+                buf_idx = 0; // Reset buffer
+            }
+        }
+    }
+    
+    free(data);
+}
+#endif
+
 // ========== RPM TX Task ==========
 static void rpm_tx_task(void *arg)
 {
@@ -369,9 +464,12 @@ static void rpm_tx_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
 
         int32_t pulses;
+        uint32_t isr_calls;
         taskENTER_CRITICAL(&spinlock);
         pulses = g_pulse_count;
+        isr_calls = g_isr_count;
         g_pulse_count = 0;
+        g_isr_count = 0;
         taskEXIT_CRITICAL(&spinlock);
 
         double cycles = (double)pulses / 8.0;
@@ -381,11 +479,16 @@ static void rpm_tx_task(void *arg)
             rpm = RPM_MAX;
 
         rpm_filt = (ALPHA * rpm) + ((1.0 - ALPHA) * rpm_filt);
-        uint16_t rpm_val = (uint16_t)rpm_filt;
+        uint16_t rpm_measured = (uint16_t)rpm_filt;
         uint16_t rpm_ref_snapshot = g_rpm_ref;
 
-        uart_write_bytes(UART_PORT, (const char *)&rpm_val, sizeof(uint16_t));
+        // Send binary data: [rpm_measured, rpm_ref] as uint16
+        uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
         uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
+        
+        // Log RPM data for monitoring with debug info
+        ESP_LOGI(TAG, "Encoder: ISR_calls=%u, pulses=%d, rpm_raw=%.1f, rpm_filt=%.1f, RPM_meas=%u, RPM_ref=%u", 
+                 (unsigned)isr_calls, (int)pulses, rpm, rpm_filt, rpm_measured, rpm_ref_snapshot);
     }
 }
 
@@ -467,7 +570,16 @@ extern "C" void app_main(void)
     phases::set_frequency_slew_rate(30.0f);
 
     // Create tasks
+#if PYTHON_DEBUG == 1
+    // Python debug mode: text commands "SET CH1 20"
     xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL, 0);
+    ESP_LOGI(TAG, "Python debug mode: Waiting for text commands (CH1=Freq, CH2=Amp, CH3=RPM)");
+#else
+    // Simulink mode: binary protocol [rpm_ref, freq] as uint16
+    xTaskCreatePinnedToCore(simulink_rx_task, "simulink_rx", 4096, NULL, 5, NULL, 0);
+    ESP_LOGI(TAG, "Simulink mode: Waiting for binary data [rpm_ref, freq]");
+#endif
+    
     xTaskCreatePinnedToCore(rpm_tx_task, "rpm_tx", 4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(pwm_task, "pwmC", 4096, &pwmC, 5, &pwmC_task_handle, 0);
     xTaskCreatePinnedToCore(pwm_task, "pwmA", 4096, &pwmA, 5, &pwmA_task_handle, 1);
@@ -475,6 +587,4 @@ extern "C" void app_main(void)
 
     // Start timer
     phases::start_phases();
-
-    ESP_LOGI(TAG, "Waiting for UART commands (CH1=Freq, CH2=Amp, CH3=RPM)");
 }
