@@ -25,6 +25,14 @@
 // Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
 #define PYTHON_DEBUG 0
 
+// Set to 1 for plant modeling mode (logs: Time, Frequency, RPM)
+// Set to 0 for normal operation
+#define PLANT_MODELING 1
+
+// Set to 1 to generate internal ramp (no Simulink needed)
+// Set to 0 to receive frequency from Simulink
+#define INTERNAL_RAMP 1
+
 #define TAG "MOTOR_AC_UART"
 
 // Encoder pins
@@ -37,10 +45,24 @@
 
 // Encoder constants (4x decoding - QEM method)
 #define PPR 199.0f                    // Pulses per revolution
-#define SAMPLE_MS 10                  // Sample period in ms
+
+#if PLANT_MODELING == 1
+    #define SAMPLE_MS 100             // Sample period in ms (plant modeling: 100ms for cleaner data)
+#else
+    #define SAMPLE_MS 10              // Sample period in ms (normal operation: 10ms)
+#endif
+
 #define ALPHA 0.1f                    // Low-pass filter coefficient (EMA)
 #define CYCLE_ADJUSTMENT 8.0f         // 4x decoding adjustment factor
 #define CONVERSION_TO_RPM 60000.0f    // Convert rev/ms to RPM
+
+// Internal ramp parameters (for plant modeling)
+#if INTERNAL_RAMP == 1
+    #define RAMP_START_HZ 20.0f       // Starting frequency (Hz)
+    #define RAMP_END_HZ 50.0f         // Ending frequency (Hz)
+    #define RAMP_DURATION_S 60.0f     // Ramp duration (seconds)
+    #define RAMP_SLOPE ((RAMP_END_HZ - RAMP_START_HZ) / RAMP_DURATION_S)  // Hz/s
+#endif
 
 // Sequence pulse interval
 #define T_PULSE_MS 250
@@ -56,6 +78,7 @@ typedef struct
 static volatile long g_pulse_count = 0;
 static volatile uint8_t g_old_AB = 0;  // Encoder state for QEM
 static volatile uint16_t g_rpm_ref = 0;
+static volatile float g_current_freq = 0.0f;  // Current frequency (Hz) for plant modeling
 static float g_filtered_rpm = 0.0f;    // EMA filter state
 static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -432,14 +455,17 @@ static void simulink_rx_task(void *arg)
                 uint16_t rpm_ref_rx = (uint16_t)(buffer[0] | (buffer[1] << 8));
                 uint16_t freq_rx = (uint16_t)(buffer[2] | (buffer[3] << 8));
                 
-                // Update RPM reference
+                // Update RPM reference (ignored in plant modeling mode)
                 g_rpm_ref = rpm_ref_rx;
                 
                 // Update frequency (already limited to 20-60 Hz in set_frequency)
                 float freq_hz = (float)freq_rx;
+                g_current_freq = freq_hz;  // Store for plant modeling
                 phases::set_frequency(freq_hz);
                 
-                ESP_LOGI(TAG, "Simulink RX: RPM_ref=%u, Freq=%.1f Hz", rpm_ref_rx, freq_hz);
+                #if PLANT_MODELING == 0
+                    ESP_LOGI(TAG, "Simulink RX: RPM_ref=%u, Freq=%.1f Hz", rpm_ref_rx, freq_hz);
+                #endif
                 
                 buf_idx = 0; // Reset buffer
             }
@@ -454,6 +480,13 @@ static void simulink_rx_task(void *arg)
 static void rpm_tx_task(void *arg)
 {
     const double RPM_MAX = 10000.0;
+    uint32_t time_ms = 0;  // Simulation time counter
+
+    #if PLANT_MODELING == 1
+        // Print CSV header for plant modeling
+        printf("Time(s),Frequency(Hz),RPM\n");
+        fflush(stdout);  // Force immediate output
+    #endif
 
     while (1)
     {
@@ -485,11 +518,73 @@ static void rpm_tx_task(void *arg)
         uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
         uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
         
-        // Log: RPM measured and reference
-        ESP_LOGI(TAG, "RPM: Measured=%u, Reference=%u (pulses=%ld)", 
-                 rpm_measured, rpm_ref_snapshot, pulses);
+        #if PLANT_MODELING == 1
+            // Plant modeling mode: Print CSV format (Time, Frequency, RPM)
+            float time_s = time_ms / 1000.0f;
+            float freq_snapshot = g_current_freq;
+            printf("%.2f,%.2f,%.2f\n", time_s, freq_snapshot, g_filtered_rpm);
+            fflush(stdout);  // Force immediate output
+        #else
+            // Normal operation: Log RPM measured and reference
+            ESP_LOGI(TAG, "RPM: Measured=%u, Reference=%u", 
+                     rpm_measured, rpm_ref_snapshot);
+        #endif
+        
+        time_ms += SAMPLE_MS;
     }
 }
+
+// ========== Internal Ramp Generator Task (for Plant Modeling) ==========
+#if INTERNAL_RAMP == 1
+static void ramp_generator_task(void *arg)
+{
+    ESP_LOGI(TAG, "Internal ramp generator ready");
+    ESP_LOGI(TAG, "Ramp config: %.1f Hz -> %.1f Hz over %.1f seconds", 
+             RAMP_START_HZ, RAMP_END_HZ, RAMP_DURATION_S);
+    
+    // Wait 3 seconds after boot to ensure system is stable
+    ESP_LOGI(TAG, "Waiting 3 seconds before starting ramp...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    ESP_LOGI(TAG, "Starting ramp NOW!");
+    
+    float current_freq = RAMP_START_HZ;
+    uint32_t time_ms = 0;
+    const uint32_t UPDATE_PERIOD_MS = 100;  // Update frequency every 100ms
+    
+    // Set initial frequency
+    g_current_freq = current_freq;
+    phases::set_frequency(current_freq);
+    
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_PERIOD_MS));
+        time_ms += UPDATE_PERIOD_MS;
+        
+        // Calculate current frequency based on ramp
+        float time_s = time_ms / 1000.0f;
+        current_freq = RAMP_START_HZ + (RAMP_SLOPE * time_s);
+        
+        // Clamp to end frequency
+        if (current_freq > RAMP_END_HZ) {
+            current_freq = RAMP_END_HZ;
+        }
+        
+        // Update frequency
+        g_current_freq = current_freq;
+        phases::set_frequency(current_freq);
+        
+        // Stop after ramp duration + 10 seconds (to capture steady state)
+        if (time_s > (RAMP_DURATION_S + 10.0f)) {
+            ESP_LOGI(TAG, "Ramp completed. Holding at %.1f Hz", current_freq);
+            // Keep running at final frequency
+            while(1) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+    }
+}
+#endif
 
 static void configure_enable_and_unused_pins(void)
 {
@@ -561,18 +656,18 @@ extern "C" void app_main(void)
 
     // Initialize motor
     phases::set_amplitude(1.0f);
-    phases::set_frequency(20.0f);
-    
-    // Configure slew rate for smooth frequency transitions
-    //   - Lower (10-20 Hz/s): Smoother, better for plant modeling
-    //   - Higher (50-100 Hz/s): Faster response, more dynamic
-    phases::set_frequency_slew_rate(30.0f);
+    phases::set_frequency(1.0f);
 
     // Create tasks
 #if PYTHON_DEBUG == 1
     // Python debug mode: text commands "SET CH1 20"
     xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL, 0);
     ESP_LOGI(TAG, "Python debug mode: Waiting for text commands (CH1=Freq, CH2=Amp, CH3=RPM)");
+#elif INTERNAL_RAMP == 1
+    // Internal ramp mode: Generate ramp internally (no Simulink needed)
+    xTaskCreatePinnedToCore(ramp_generator_task, "ramp_gen", 4096, NULL, 5, NULL, 0);
+    ESP_LOGI(TAG, "Internal ramp mode: Generating %.1f Hz -> %.1f Hz over %.1f s", 
+             RAMP_START_HZ, RAMP_END_HZ, RAMP_DURATION_S);
 #else
     // Simulink mode: binary protocol [rpm_ref, freq] as uint16
     xTaskCreatePinnedToCore(simulink_rx_task, "simulink_rx", 4096, NULL, 5, NULL, 0);
