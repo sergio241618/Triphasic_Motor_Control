@@ -23,22 +23,24 @@
 // ========== MODE SELECTION ==========
 // Set to 1 for Python debug mode (text commands: "SET CH1 20")
 // Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
-#define PYTHON_DEBUG 1
+#define PYTHON_DEBUG 0
 
 #define TAG "MOTOR_AC_UART"
 
 // Encoder pins
-#define PIN_ENC_A GPIO_NUM_13
-#define PIN_ENC_B GPIO_NUM_15
+#define PIN_ENC_A GPIO_NUM_16
+#define PIN_ENC_B GPIO_NUM_17
 
 // UART
 #define UART_PORT UART_NUM_0
 #define UART_BAUD 115200
 
-// Encoder constants
-#define PULSES_PER_REV 199
-#define SAMPLE_MS 10
-#define ALPHA 0.1f
+// Encoder constants (4x decoding - QEM method)
+#define PPR 199.0f                    // Pulses per revolution
+#define SAMPLE_MS 10                  // Sample period in ms
+#define ALPHA 0.1f                    // Low-pass filter coefficient (EMA)
+#define CYCLE_ADJUSTMENT 8.0f         // 4x decoding adjustment factor
+#define CONVERSION_TO_RPM 60000.0f    // Convert rev/ms to RPM
 
 // Sequence pulse interval
 #define T_PULSE_MS 250
@@ -51,13 +53,14 @@ typedef struct
 } seq_t;
 
 // Globals
-static volatile int32_t g_pulse_count = 0;
-static volatile uint32_t g_isr_count = 0;  // Debug: count ISR calls
-static volatile uint32_t g_last_isr_us = 0;  // For debouncing
-static volatile uint8_t old_AB = 0;
-static const int8_t QEM[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+static volatile long g_pulse_count = 0;
+static volatile uint8_t g_old_AB = 0;  // Encoder state for QEM
 static volatile uint16_t g_rpm_ref = 0;
+static float g_filtered_rpm = 0.0f;    // EMA filter state
 static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
+
+// QEM (Quadrature Encoder Method) lookup table for 4x decoding
+static const int8_t QEM[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
 
 static pwm_task_config_t pwmA;
 static pwm_task_config_t pwmB;
@@ -77,34 +80,21 @@ static QueueHandle_t cmdQueueC = NULL;
 constexpr uint32_t PLS_M_TAU_3_INT = phases::MAX_THETA_INT / 3u; // +120°
 constexpr uint32_t MNS_M_TAU_3_INT = (~PLS_M_TAU_3_INT) + 1u;    // +240°
 
-// ========== Encoder ISR (Arduino-style: single interrupt on PIN_A) ==========
+// ========== Encoder ISR (4x Decoding - QEM Method) ==========
 static void IRAM_ATTR encoder_isr(void *arg)
 {
-    // Debounce: ignore interrupts too close together (3us minimum)
-    const uint32_t DEBOUNCE_US = 3;
-    uint32_t now_us = esp_timer_get_time();
-    
-    if ((now_us - g_last_isr_us) < DEBOUNCE_US) {
-        return;  // Too soon, ignore
-    }
-    g_last_isr_us = now_us;
-    
-    portENTER_CRITICAL_ISR(&spinlock);
-    
-    g_isr_count++;  // Debug: count ISR calls
-    
-    // Fast GPIO read - read PIN_B state
+    // Read both encoder pins directly from GPIO register
     uint32_t gpio_in = GPIO.in;
+    
+    // Shift old state and read new state
+    g_old_AB <<= 2;
+    uint8_t state_A = (gpio_in >> PIN_ENC_A) & 1;
     uint8_t state_B = (gpio_in >> PIN_ENC_B) & 1;
+    uint8_t new_AB = (state_A << 1) | state_B;
+    g_old_AB |= new_AB;
     
-    // Increment or decrement based on PIN_B state
-    if (state_B == 0) {
-        g_pulse_count++;
-    } else {
-        g_pulse_count--;
-    }
-    
-    portEXIT_CRITICAL_ISR(&spinlock);
+    // Use QEM lookup table to determine direction and count
+    g_pulse_count += QEM[g_old_AB & 0x0f];
 }
 
 // ========== Notification from ISR ==========
@@ -142,15 +132,22 @@ static void uart_init(void)
     uart_driver_install(UART_PORT, 1024, 1024, 0, NULL, 0);
 }
 
-// ========== Encoder Init ==========
+// ========== Encoder Init (4x Decoding - QEM Method) ==========
 static void encoder_init(void)
 {
+    // Reset pins to ensure clean state
+    gpio_reset_pin(PIN_ENC_A);
+    gpio_reset_pin(PIN_ENC_B);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // Configure BOTH pins with interrupts on ANY edge (4x decoding)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_ENC_A) | (1ULL << PIN_ENC_B),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE};
+        .intr_type = GPIO_INTR_ANYEDGE  // Interrupt on BOTH edges
+    };
     
     esp_err_t err = gpio_config(&io_conf);
     if (err != ESP_OK) {
@@ -158,7 +155,8 @@ static void encoder_init(void)
         return;
     }
     
-    old_AB = ((gpio_get_level(PIN_ENC_A) << 1) | gpio_get_level(PIN_ENC_B));
+    // Read initial state of encoder
+    g_old_AB = ((gpio_get_level(PIN_ENC_A) << 1) | gpio_get_level(PIN_ENC_B));
     
     // Install ISR service if not already installed
     err = gpio_install_isr_service(0);
@@ -167,7 +165,7 @@ static void encoder_init(void)
         return;
     }
     
-    // Add ISR handlers
+    // Add ISR handlers for BOTH pins (critical for 4x decoding)
     err = gpio_isr_handler_add(PIN_ENC_A, encoder_isr, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add ISR for PIN_A: %s", esp_err_to_name(err));
@@ -180,8 +178,8 @@ static void encoder_init(void)
         return;
     }
     
-    ESP_LOGI(TAG, "Encoder initialized: PIN_A=%d, PIN_B=%d, initial_state=%d", 
-             PIN_ENC_A, PIN_ENC_B, old_AB);
+    ESP_LOGI(TAG, "Encoder initialized (4x decoding): PIN_A=%d, PIN_B=%d", 
+             PIN_ENC_A, PIN_ENC_B);
 }
 
 // ========== PWM TASK ==========
@@ -455,40 +453,41 @@ static void simulink_rx_task(void *arg)
 // ========== RPM TX Task ==========
 static void rpm_tx_task(void *arg)
 {
-    const double Ts = SAMPLE_MS / 1000.0;
-    double rpm_filt = 0.0;
     const double RPM_MAX = 10000.0;
 
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
 
-        int32_t pulses;
-        uint32_t isr_calls;
-        taskENTER_CRITICAL(&spinlock);
+        // Get pulse count (critical section to avoid race condition)
+        long pulses;
+        portDISABLE_INTERRUPTS();
         pulses = g_pulse_count;
-        isr_calls = g_isr_count;
         g_pulse_count = 0;
-        g_isr_count = 0;
-        taskEXIT_CRITICAL(&spinlock);
+        portENABLE_INTERRUPTS();
 
-        double cycles = (double)pulses / 8.0;
-        double revolutions = cycles / (double)PULSES_PER_REV;
-        double rpm = fabs((revolutions / Ts) * 60.0);
-        if (rpm > RPM_MAX)
-            rpm = RPM_MAX;
+        // RPM calculation (4x decoding - QEM method)
+        float cycles = (float)pulses / CYCLE_ADJUSTMENT;
+        float revolutions = cycles / PPR;
+        float raw_rpm = (revolutions / (float)SAMPLE_MS) * CONVERSION_TO_RPM;
 
-        rpm_filt = (ALPHA * rpm) + ((1.0 - ALPHA) * rpm_filt);
-        uint16_t rpm_measured = (uint16_t)rpm_filt;
+        // Absolute value and clamp
+        if (raw_rpm < 0) raw_rpm = -raw_rpm;
+        if (raw_rpm > RPM_MAX) raw_rpm = RPM_MAX;
+
+        // Apply EMA (Exponential Moving Average) filter
+        g_filtered_rpm = (ALPHA * raw_rpm) + ((1.0f - ALPHA) * g_filtered_rpm);
+
+        uint16_t rpm_measured = (uint16_t)g_filtered_rpm;
         uint16_t rpm_ref_snapshot = g_rpm_ref;
 
         // Send binary data: [rpm_measured, rpm_ref] as uint16
         uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
         uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
         
-        // Log RPM data for monitoring with debug info
-        ESP_LOGI(TAG, "Encoder: ISR_calls=%u, pulses=%d, rpm_raw=%.1f, rpm_filt=%.1f, RPM_meas=%u, RPM_ref=%u", 
-                 (unsigned)isr_calls, (int)pulses, rpm, rpm_filt, rpm_measured, rpm_ref_snapshot);
+        // Log: RPM measured and reference
+        ESP_LOGI(TAG, "RPM: Measured=%u, Reference=%u (pulses=%ld)", 
+                 rpm_measured, rpm_ref_snapshot, pulses);
     }
 }
 
