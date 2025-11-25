@@ -23,7 +23,7 @@
 // ========== MODE SELECTION ==========
 // Set to 1 for Python debug mode (text commands: "SET CH1 20")
 // Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
-#define PYTHON_DEBUG 1
+#define PYTHON_DEBUG 0
 
 // Set to 1 for plant modeling mode (logs: Time, Frequency, RPM)
 // Set to 0 for normal operation
@@ -33,7 +33,7 @@
 // Set to 0 to receive frequency from Simulink
 #define INTERNAL_RAMP 0
 
-#define TAG "MOTOR_AC_UART"
+#define TAG "MOTOR_AC_UART" 
 
 // Encoder pins
 #define PIN_ENC_A GPIO_NUM_16
@@ -77,7 +77,7 @@ typedef struct
 // Globals
 static volatile long g_pulse_count = 0;
 static volatile uint8_t g_old_AB = 0;  // Encoder state for QEM
-static volatile uint16_t g_rpm_ref = 0;
+static volatile int16_t g_rpm_ref = 0;
 static volatile float g_current_freq = 0.0f;  // Current frequency (Hz) for plant modeling
 static float g_filtered_rpm = 0.0f;    // EMA filter state
 static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -278,8 +278,8 @@ static void pwm_task(void *pv)
                 else
                 {
                     // CH3 = RPM Reference
-                    g_rpm_ref = (uint16_t)value;
-                    ESP_LOGI(TAG, "RPM Ref: %u", (unsigned)g_rpm_ref);
+                    g_rpm_ref = (int16_t)value;
+                    ESP_LOGI(TAG, "RPM Ref: %d", (int)g_rpm_ref);
                 }
 
                 // Don't delay here - continue PWM generation immediately
@@ -438,7 +438,7 @@ static void simulink_rx_task(void *arg)
     uint8_t buffer[4]; // Buffer for 2 x uint16 = 4 bytes
     uint8_t buf_idx = 0;
 
-    ESP_LOGI(TAG, "Simulink RX task started - waiting for [rpm_ref, freq] as uint16");
+    ESP_LOGI(TAG, "Simulink RX task started - waiting for [rpm_ref, freq] as int16");
 
     while (1)
     {
@@ -451,9 +451,9 @@ static void simulink_rx_task(void *arg)
             // When we have 4 bytes (2 x uint16), process them
             if (buf_idx >= 4)
             {
-                // Parse: [rpm_ref_u16, freq_u16]
-                uint16_t rpm_ref_rx = (uint16_t)(buffer[0] | (buffer[1] << 8));
-                uint16_t freq_rx = (uint16_t)(buffer[2] | (buffer[3] << 8));
+                // Parse: [rpm_ref_i16, freq_i16]
+                int16_t rpm_ref_rx = (int16_t)(buffer[0] | (buffer[1] << 8));
+                int16_t freq_rx = (int16_t)(buffer[2] | (buffer[3] << 8));
                 
                 // Update RPM reference (ignored in plant modeling mode)
                 g_rpm_ref = rpm_ref_rx;
@@ -507,8 +507,8 @@ static void rpm_tx_task(void *arg)
         // Apply EMA (Exponential Moving Average) filter
         g_filtered_rpm = (ALPHA * raw_rpm) + ((1.0f - ALPHA) * g_filtered_rpm);
 
-        uint16_t rpm_measured = (uint16_t)g_filtered_rpm;
-        uint16_t rpm_ref_snapshot = g_rpm_ref;
+        int16_t rpm_measured = (int16_t)g_filtered_rpm;
+        int16_t rpm_ref_snapshot = g_rpm_ref;
         
         #if PLANT_MODELING == 1
             // Plant modeling mode: Print CSV format (Time, Frequency, RPM)
@@ -517,9 +517,9 @@ static void rpm_tx_task(void *arg)
             printf("%.2f,%.2f,%.2f\n", time_s, freq_snapshot, g_filtered_rpm);
             fflush(stdout);  // Force immediate output
         #else
-            // Normal operation: Send binary uint16 data [rpm_ref, rpm_measured] to Simulink
-            uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(uint16_t));
-            uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(uint16_t));
+            // Normal operation: Send binary int16 data [rpm_ref, rpm_measured] to Simulink
+            uart_write_bytes(UART_PORT, (const char *)&rpm_ref_snapshot, sizeof(int16_t));
+            uart_write_bytes(UART_PORT, (const char *)&rpm_measured, sizeof(int16_t));
         #endif
         
         time_ms += SAMPLE_MS;
@@ -661,9 +661,9 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Internal ramp mode: Generating %.1f Hz -> %.1f Hz over %.1f s", 
              RAMP_START_HZ, RAMP_END_HZ, RAMP_DURATION_S);
 #else
-    // Simulink mode: binary protocol [rpm_ref, freq] as uint16
+    // Simulink mode: binary protocol [rpm_ref, freq] as int16
     xTaskCreatePinnedToCore(simulink_rx_task, "simulink_rx", 4096, NULL, 5, NULL, 0);
-    ESP_LOGI(TAG, "Simulink mode: Waiting for binary data [rpm_ref, freq]");
+    ESP_LOGI(TAG, "Simulink mode: Waiting for binary data [rpm_ref, freq] as int16");
 #endif
     
     xTaskCreatePinnedToCore(rpm_tx_task, "rpm_tx", 4096, NULL, 5, NULL, 0);
