@@ -16,7 +16,7 @@
 
 namespace phases {
 
-// constants and mappings (adjust if you change pins)
+// constants and mappings
 constexpr float M_TAU = M_PI * 2.0f;
 constexpr uint32_t MAX_THETA_INT = UINT32_MAX;
 constexpr uint32_t SINE_WAVE_SAMPLE_TIMEus = CONFIG_SINE_WAVE_SAMPLE_TIMEus;
@@ -30,7 +30,7 @@ constexpr mcpwm_timer_t PWM_TIMER_ID1 = MCPWM_TIMER_1;
 constexpr mcpwm_timer_t PWM_TIMER_ID2 = MCPWM_TIMER_2;
 constexpr uint32_t PWM_FREQUENCY_Hz = 20000u;
 
-// pins (adjust to your board)
+// pins
 constexpr gpio_num_t A_HIGH_GPIO = (gpio_num_t)5;
 constexpr gpio_num_t A_LOW_GPIO  = (gpio_num_t)26;
 constexpr gpio_num_t B_HIGH_GPIO = (gpio_num_t)18;

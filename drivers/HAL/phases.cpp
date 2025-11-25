@@ -68,7 +68,7 @@ uint32_t phases::phases_get_theta_int(void) {
 void IRAM_ATTR phases::phase_output_intr(void* args) {
     (void)args;
     
-    // 1. Apply slew rate limiting (rampa de frecuencia)
+    // 1. Apply slew rate limiting (frequency ramp)
     if (_angular_speed_int < _target_angular_speed_int) {
         // Accelerating
         uint32_t diff = _target_angular_speed_int - _angular_speed_int;
@@ -330,10 +330,10 @@ esp_err_t pwm_hal_set_deadtime(mcpwm_unit_t unit, mcpwm_timer_t timer,
     const uint32_t PWM_FREQ = PWM_FREQUENCY_Hz; 
     const uint32_t TICKS_PER_PERIOD = 1000;
     
-    // ns por tick
+    // ns per tick
     uint32_t ns_per_tick = (1000000000UL / PWM_FREQ) / TICKS_PER_PERIOD;
     
-    // Convertir nanosegundos a ticks
+    // Convert nanoseconds to ticks
     uint32_t red_ticks = (red_ns + ns_per_tick - 1) / ns_per_tick;  // Round up
     uint32_t fed_ticks = (fed_ns + ns_per_tick - 1) / ns_per_tick;
     

@@ -1,8 +1,4 @@
-/** main/app_main.cpp
- * PRODUCTION VERSION - PID Control via UART
- * - Frequency control (CH1)
- * - Amplitude control (CH2)
- * - RPM Reference (CH3)
+/* main/app_main.cpp
  */
 
 #include <stdio.h>
@@ -16,11 +12,10 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "soc/gpio_struct.h"  // For direct GPIO register access (GPIO.in)
+#include "soc/gpio_struct.h"
 #include "phases.hpp"
 #include "pwm.h"
 
-// ========== MODE SELECTION ==========
 // Set to 1 for Python debug mode (text commands: "SET CH1 20")
 // Set to 0 for Simulink mode (binary: [rpm_ref, freq] as uint16)
 #define PYTHON_DEBUG 0
@@ -66,12 +61,12 @@
 
 // Sequence pulse interval
 #define T_PULSE_MS 250
-#define MAX_SEQ_LEN 16
 
+// Dynamic sequence structure (uses heap memory)
 typedef struct
 {
-    uint8_t len;
-    uint32_t vals[MAX_SEQ_LEN];
+    uint16_t len;           // Number of values in sequence
+    uint32_t *vals;         // Pointer to dynamically allocated array
 } seq_t;
 
 // Globals
@@ -225,6 +220,7 @@ static void pwm_task(void *pv)
 
     seq_t local_seq;
     local_seq.len = 0;
+    local_seq.vals = NULL;
     QueueHandle_t my_cmd_queue = NULL;
 
     if (cfg->pwm_timer == phases::PWM_TIMER_ID0)
@@ -252,40 +248,47 @@ static void pwm_task(void *pv)
         // 1) Check for command sequence
         if (my_cmd_queue != NULL && xQueueReceive(my_cmd_queue, &local_seq, 0) == pdTRUE)
         {
-
-            for (uint8_t i = 0; i < local_seq.len; ++i)
+            // Process sequence if valid
+            if (local_seq.vals != NULL && local_seq.len > 0)
             {
-                uint32_t value = local_seq.vals[i];
+                for (uint16_t i = 0; i < local_seq.len; ++i)
+                {
+                    uint32_t value = local_seq.vals[i];
 
-                if (cfg->pwm_timer == phases::PWM_TIMER_ID0)
-                {
-                    // CH1 = Frequency
-                    float freq_hz = (float)value;
-                    phases::set_frequency(freq_hz);
-                    ESP_LOGI(TAG, "Frequency: %.2f Hz", freq_hz);
-                }
-                else if (cfg->pwm_timer == phases::PWM_TIMER_ID1)
-                {
-                    // CH2 = Amplitude
-                    float amp = (float)value / 100.0f;
-                    if (amp > 1.0f)
-                        amp = 1.0f;
-                    if (amp < 0.0f)
-                        amp = 0.0f;
-                    phases::set_amplitude(amp);
-                    ESP_LOGI(TAG, "Amplitude: %.0f%%", amp * 100.0f);
-                }
-                else
-                {
-                    // CH3 = RPM Reference
-                    g_rpm_ref = (int16_t)value;
-                    ESP_LOGI(TAG, "RPM Ref: %d", (int)g_rpm_ref);
-                }
+                    if (cfg->pwm_timer == phases::PWM_TIMER_ID0)
+                    {
+                        // CH1 = Frequency
+                        float freq_hz = (float)value;
+                        phases::set_frequency(freq_hz);
+                        ESP_LOGI(TAG, "Frequency: %.2f Hz", freq_hz);
+                    }
+                    else if (cfg->pwm_timer == phases::PWM_TIMER_ID1)
+                    {
+                        // CH2 = Amplitude
+                        float amp = (float)value / 100.0f;
+                        if (amp > 1.0f)
+                            amp = 1.0f;
+                        if (amp < 0.0f)
+                            amp = 0.0f;
+                        phases::set_amplitude(amp);
+                        ESP_LOGI(TAG, "Amplitude: %.0f%%", amp * 100.0f);
+                    }
+                    else
+                    {
+                        // CH3 = RPM Reference
+                        g_rpm_ref = (int16_t)value;
+                        ESP_LOGI(TAG, "RPM Ref: %d", (int)g_rpm_ref);
+                    }
 
-                // Don't delay here - continue PWM generation immediately
-                // to maintain continuous sinusoidal waveform
+                    // Don't delay here - continue PWM generation immediately
+                    // to maintain continuous sinusoidal waveform
+                }
+                
+                // Free dynamically allocated memory after processing
+                free(local_seq.vals);
+                local_seq.vals = NULL;
+                local_seq.len = 0;
             }
-            local_seq.len = 0;
         }
 
         // 2) Check legacy float queue
@@ -397,29 +400,57 @@ static void uart_rx_task(void *arg)
                 if (target_cmd_queue == NULL)
                     continue;
 
-                seq_t seq;
-                seq.len = 0;
-
+                // First pass: count how many values we have
+                uint16_t value_count = 0;
                 size_t start = 0;
-                while (start < token3.size() && seq.len < MAX_SEQ_LEN)
+                while (start < token3.size())
                 {
                     size_t end = token3.find(',', start);
                     if (end == std::string::npos)
                         end = token3.size();
-
+                    
                     std::string val_str = token3.substr(start, end - start);
                     trim(val_str);
-
                     if (!val_str.empty())
-                    {
-                        uint32_t value = strtoul(val_str.c_str(), NULL, 10);
-                        seq.vals[seq.len++] = value;
-                    }
+                        value_count++;
+                    
                     start = end + 1;
                 }
 
-                if (seq.len > 0)
+                // Allocate memory for the sequence
+                if (value_count > 0)
                 {
+                    seq_t seq;
+                    seq.len = value_count;
+                    seq.vals = (uint32_t *)malloc(value_count * sizeof(uint32_t));
+                    
+                    if (seq.vals == NULL)
+                    {
+                        ESP_LOGE(TAG, "Failed to allocate memory for sequence of %d values", value_count);
+                        continue;
+                    }
+
+                    // Second pass: parse and store values
+                    uint16_t idx = 0;
+                    start = 0;
+                    while (start < token3.size() && idx < value_count)
+                    {
+                        size_t end = token3.find(',', start);
+                        if (end == std::string::npos)
+                            end = token3.size();
+
+                        std::string val_str = token3.substr(start, end - start);
+                        trim(val_str);
+
+                        if (!val_str.empty())
+                        {
+                            uint32_t value = strtoul(val_str.c_str(), NULL, 10);
+                            seq.vals[idx++] = value;
+                        }
+                        start = end + 1;
+                    }
+
+                    ESP_LOGI(TAG, "Parsed sequence with %d values", seq.len);
                     xQueueOverwrite(target_cmd_queue, &seq);
                 }
             }
@@ -581,8 +612,8 @@ static void ramp_generator_task(void *arg)
 static void configure_enable_and_unused_pins(void)
 {
     gpio_set_direction(GPIO_NUM_23, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_23, 1);
-    ESP_LOGI(TAG, "ENABLE pin (23) set HIGH");
+    gpio_set_level(GPIO_NUM_23, 0);
+    ESP_LOGI(TAG, "ENABLE pin (23) set LOW");
     ESP_LOGI(TAG, "GPIO configuration complete");
 }
 

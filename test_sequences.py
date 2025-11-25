@@ -14,8 +14,7 @@ SEQ_CH2 = "100,80,60,40,20,0,20,40,60,80,100"
 SEQ_CH3 = "1000,2000,3000,1500"
 
 # Wait time (in seconds) between sending each complete sequence
-# (Give the ESP32 time to execute its own T_PULSE_MS sequence)
-WAIT_BETWEEN_SEQUENCES = 8 
+WAIT_BETWEEN_SEQUENCES = 5 
 
 def run_automatic_test(port=None):
     ser = connect_to_esp32(port)

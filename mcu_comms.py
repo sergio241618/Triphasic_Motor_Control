@@ -3,10 +3,6 @@ import time
 import sys
 
 # --- Configuration ---
-# Change this to the serial port of your ESP32
-# Linux: /dev/ttyUSB0
-# macOS: /dev/cu.usbserial-XXXX
-# Windows: COM3
 DEFAULT_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 # ---------------------
@@ -17,7 +13,7 @@ def get_serial_port():
         return 'COM3'
     if sys.platform.startswith('darwin'):
         # macOS
-        return '/dev/cu.usbserial-0001' # Change this
+        return '/dev/cu.usbserial-0001'
     # Assume Linux/other
     return '/dev/ttyUSB0'
 
@@ -34,7 +30,7 @@ def send_command(ser, channel, values):
     ser.write(command.encode('utf-8'))
     
     # Print what we sent (for debugging)
-    print(f"PC -> ESP32: {command.strip()}") # .strip() removes the \n for clean printing
+    print(f"PC -> ESP32: {command.strip()}")
 
 def connect_to_esp32(port=None, baud=BAUD_RATE):
     """
@@ -47,21 +43,11 @@ def connect_to_esp32(port=None, baud=BAUD_RATE):
     print(f"Attempting to connect to {port} at {baud} bps...")
     
     try:
-        # We change the timeout from 1 second to 50ms (0.05)
-        # This prevents ser.readline() from blocking the script indefinitely
-        # if the ESP32 is not sending data.
         ser = serial.Serial(port, baud, timeout=0.05)
-        
-        # !! IMPORTANT !!
-        # Wait 2 seconds. When pyserial opens the port,
-        # the DTR pin of the USB-Serial chip is activated,
-        # resetting the ESP32. We need to give it time to boot up.
         time.sleep(2)
-        
-        ser.flushInput() # Clear any junk data from the input buffer
+        ser.flushInput()
         print("Connection successful.")
         return ser
-        
     except serial.SerialException as e:
         print(f"Error: Could not open port {port}.")
         print(f"Details: {e}")
