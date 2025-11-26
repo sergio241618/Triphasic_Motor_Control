@@ -2,20 +2,6 @@
 
 Three-phase AC motor control system implemented on ESP32 using Sinusoidal PWM (SPWM) modulation. The firmware supports multiple operation modes for different use cases: Python debugging, Simulink integration, and plant modeling with internal ramp generation.
 
----
-
-## 📋 Table of Contents
-
-1. [Operation Modes](#operation-modes)
-2. [System Architecture](#system-architecture)
-3. [UART Communication Protocols](#uart-communication-protocols)
-4. [Encoder System](#encoder-system)
-5. [FreeRTOS Tasks](#freertos-tasks)
-6. [Hardware Configuration](#hardware-configuration)
-7. [Usage Examples](#usage-examples)
-
----
-
 ## 🎛️ Operation Modes
 
 The system supports **three operation modes** configurable via defines in `app_main.cpp`:
