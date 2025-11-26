@@ -44,10 +44,11 @@
 #if PLANT_MODELING == 1
     #define SAMPLE_MS 100             // Sample period in ms (plant modeling: 100ms for cleaner data)
 #else
-    #define SAMPLE_MS 10              // Sample period in ms (normal operation: 10ms)
+    #define SAMPLE_MS 10             // Sample period in ms (normal operation: 10ms)
 #endif
 
-#define ALPHA 0.1f                    // Low-pass filter coefficient (EMA)
+#define ALPHA 0.7f                    // Low-pass filter coefficient (EMA)
+#define RPM_WINDOW_SIZE 5             // Moving average window size
 #define CYCLE_ADJUSTMENT 8.0f         // 4x decoding adjustment factor
 #define CONVERSION_TO_RPM 60000.0f    // Convert rev/ms to RPM
 
@@ -535,8 +536,21 @@ static void rpm_tx_task(void *arg)
         if (raw_rpm < 0) raw_rpm = -raw_rpm;
         if (raw_rpm > RPM_MAX) raw_rpm = RPM_MAX;
 
-        // Apply EMA (Exponential Moving Average) filter
-        g_filtered_rpm = (ALPHA * raw_rpm) + ((1.0f - ALPHA) * g_filtered_rpm);
+        // Apply moving average filter for smoother response
+        static float rpm_buffer[RPM_WINDOW_SIZE] = {0};
+        static int buf_idx = 0;
+        
+        rpm_buffer[buf_idx] = raw_rpm;
+        buf_idx = (buf_idx + 1) % RPM_WINDOW_SIZE;
+        
+        float avg_rpm = 0;
+        for (int i = 0; i < RPM_WINDOW_SIZE; i++) {
+            avg_rpm += rpm_buffer[i];
+        }
+        avg_rpm /= RPM_WINDOW_SIZE;
+        
+        // Apply EMA on top of moving average for extra smoothness
+        g_filtered_rpm = (ALPHA * avg_rpm) + ((1.0f - ALPHA) * g_filtered_rpm);
 
         int16_t rpm_measured = (int16_t)g_filtered_rpm;
         int16_t rpm_ref_snapshot = g_rpm_ref;
@@ -609,13 +623,9 @@ static void ramp_generator_task(void *arg)
 }
 #endif
 
-static void configure_enable_and_unused_pins(void)
-{
-    gpio_set_direction(GPIO_NUM_23, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_23, 0);
-    ESP_LOGI(TAG, "ENABLE pin (23) set LOW");
-    ESP_LOGI(TAG, "GPIO configuration complete");
-}
+// ENABLE pin (GPIO 23) is configured and controlled by phases.cpp
+// - init_phases() sets it to LOW
+// - start_phases() sets it to HIGH
 
 // ========== app_main ==========
 extern "C" void app_main(void)
@@ -623,7 +633,7 @@ extern "C" void app_main(void)
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
 
-    configure_enable_and_unused_pins();
+    // ENABLE pin configured by phases::init_phases()
 
     uart_init();
     encoder_init();
@@ -679,7 +689,7 @@ extern "C" void app_main(void)
 
     // Initialize motor
     phases::set_amplitude(1.0f);
-    phases::set_frequency(1.0f);
+    phases::set_frequency(20.0f);
 
     // Create tasks
 #if PYTHON_DEBUG == 1
@@ -698,7 +708,7 @@ extern "C" void app_main(void)
 #endif
     
     xTaskCreatePinnedToCore(rpm_tx_task, "rpm_tx", 4096, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(pwm_task, "pwmC", 4096, &pwmC, 5, &pwmC_task_handle, 0);
+    xTaskCreatePinnedToCore(pwm_task, "pwmC", 4096, &pwmC, 5, &pwmC_task_handle, 1);
     xTaskCreatePinnedToCore(pwm_task, "pwmA", 4096, &pwmA, 5, &pwmA_task_handle, 1);
     xTaskCreatePinnedToCore(pwm_task, "pwmB", 4096, &pwmB, 5, &pwmB_task_handle, 1);
 

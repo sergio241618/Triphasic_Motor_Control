@@ -193,7 +193,7 @@ float phases::get_amplitude(void) { return g_amplitude; }
 void phases::set_frequency(const float frequency_hz) {
     // Motor operating range limits: 20 Hz to 60 Hz
     const float MIN_MOTOR_FREQ = 20.0f;
-    const float MAX_MOTOR_FREQ = 60.0f;
+    const float MAX_MOTOR_FREQ = 50.0f;
     
     float limited_freq = frequency_hz;
     

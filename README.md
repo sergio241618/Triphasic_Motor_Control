@@ -617,9 +617,12 @@ sys = tfest(data, 2, 1);  % 2nd order system
 
 ### Requirements
 
-- ESP-IDF v4.4 or higher
+- **ESP-IDF v4.4 or earlier** (MCPWM Legacy API not available in v5.0+)
 - Python 3.7+ (for interface scripts)
 - pyserial (`pip install pyserial`)
+
+> [!IMPORTANT]
+> This project uses the MCPWM Legacy API which is only available in ESP-IDF v4.4 and earlier versions. ESP-IDF v5.0+ uses a completely different MCPWM API that is incompatible with this code.
 
 ### Compilation
 
